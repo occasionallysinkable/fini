@@ -9,7 +9,7 @@ import {
   resolveProjectPath,
   resolvePerson,
 } from "@/lib/queries";
-import { parse, inferKind, type Role, type Kind } from "@/lib/parse";
+import { parse, inferKind, todayInZone, weekdayOf, type Role, type Kind } from "@/lib/parse";
 
 async function requireUser() {
   const session = await auth();
@@ -51,6 +51,16 @@ export async function captureTask(
   }
 
   const ctx = await buildCaptureContext();
+
+  // Resolve "today" in the user's own zone (invariant 10). The client sends its
+  // IANA zone so the stored date matches the day the user is actually living,
+  // not the server's UTC date. Falls back to the context's zone if absent.
+  const tz = String(formData.get("tz") ?? "").trim();
+  if (tz) {
+    ctx.today = todayInZone(tz);
+    ctx.todayWeekday = weekdayOf(ctx.today);
+  }
+
   const p = parse(raw, ctx);
 
   if (!p.title) {
