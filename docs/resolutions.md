@@ -263,6 +263,7 @@ A chain block prints the word *deadline* under its title whenever the block is t
 | R26 | Chain blocks marked by a magenta edge alone | The word *deadline* prints beside it. |
 | R27 | One canonical spelling per field, and the default estimate off | Many spellings per field, all echoed the same way. The default estimate ships on. |
 | R28 | reminders.md gave `!` to the reminder token | `!` sets the estimate; `+` sets a reminder. |
+| R29 | Waking hours were 07:00–23:00, doing an unstated job | One editable Settings value, default 00:00–00:00 (whole day), may cross midnight. |
 
 ## Corrected by building the parser
 
@@ -280,3 +281,20 @@ the task.
 
 The sentence in reminders.md that gives `!` to reminders is wrong and
 is corrected by this.
+
+### R29 · Waking hours are one editable setting, and they cover the whole day by default
+
+Waking hours do two jobs. They hold a reminder that would fire while
+you are asleep until your day starts, and until shifts exist they stand
+in for one, which decides when the R15 caption speaks.
+
+They default to 00:00 to 00:00, the whole day, and they are a single
+setting in Settings that can be changed at any time. Reminders are
+opt-in by decision, so a reminder you set for 03:00 fires at 03:00. The
+app does not overrule an hour you chose on purpose. Somebody who does
+not want to be woken sets the window, and one setting covers every
+reminder rather than a question per task.
+
+A window may cross midnight — 11:00 to 03:00 is a legitimate answer and
+the arithmetic must handle it. While the window is the full day, no
+reminder is ever held, and R15 stays silent until real shifts exist.

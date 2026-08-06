@@ -72,10 +72,15 @@ export async function buildCaptureContext(): Promise<ParseContext> {
     return [{ name: sh.name, startMinutes: start, endMinutes: end, weekdays: sh.weekdays }];
   });
 
-  // Fall back to the implicit Day shift when none are configured yet.
+  // Fall back to the implicit Day shift when none are configured yet: it stands
+  // in for shifts so R15 has something to check against (R29). Waking hours
+  // default to the whole day (00:00–00:00), and a full-day window keeps R15
+  // silent until real shifts exist. The waking-hours setting is edited in
+  // Settings — that UI is not WP2; it belongs with the Settings screen (R19),
+  // alongside the shift editor R13 puts there.
   if (shiftWindows.length === 0) {
-    const start = hhmmToMinutes(user?.wakingStart) ?? 7 * 60;
-    const end = hhmmToMinutes(user?.wakingEnd) ?? 23 * 60;
+    const start = hhmmToMinutes(user?.wakingStart) ?? 0;
+    const end = hhmmToMinutes(user?.wakingEnd) ?? 0;
     shiftWindows = [
       { name: "Day", startMinutes: start, endMinutes: end, weekdays: [true, true, true, true, true, true, true] },
     ];

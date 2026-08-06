@@ -328,6 +328,26 @@ describe("R15 · one caption when a due time is outside every shift", () => {
   });
 });
 
+describe("R29 · waking hours: full day is silent, and a window may cross midnight", () => {
+  const allWeek = [true, true, true, true, true, true, true];
+
+  it("a full-day window (00:00–00:00) never speaks", () => {
+    const fullDay: ShiftWindow = { name: "Day", startMinutes: 0, endMinutes: 0, weekdays: allWeek };
+    for (const t of ["00:00", "03:00", "12:00", "20:00", "23:59"]) {
+      expect(computeCaption("2026-08-13", t, ctx({ shifts: [fullDay] }))).toBeNull();
+    }
+  });
+
+  it("a window that crosses midnight treats the small hours as inside", () => {
+    // Awake 11:00 → 03:00. Inside from 11:00 through 02:59; outside 03:00–10:59.
+    const night: ShiftWindow = { name: "Late", startMinutes: 11 * 60, endMinutes: 3 * 60, weekdays: allWeek };
+    const c = ctx({ shifts: [night] });
+    expect(computeCaption("2026-08-13", "01:00", c)).toBeNull(); // inside, past midnight
+    expect(computeCaption("2026-08-13", "23:30", c)).toBeNull(); // inside, before midnight
+    expect(computeCaption("2026-08-13", "05:00", c)).toBe("05:00 is outside your shifts on Thursday");
+  });
+});
+
 describe("invariant 13 · nothing understood is discarded, nothing else is kept", () => {
   it("keeps unparsed words in the title and pulls every token out", () => {
     const r = parse(
