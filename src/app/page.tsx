@@ -1,7 +1,13 @@
 import Link from "next/link";
 import { auth, signOut } from "@/auth";
-import { getActiveTasks, getDeletedTasks, getRecentActivity } from "@/lib/queries";
-import { createTask, renameTask, deleteTask, undoActivity } from "./actions";
+import {
+  getActiveTasks,
+  getDeletedTasks,
+  getRecentActivity,
+  buildCaptureContext,
+} from "@/lib/queries";
+import { renameTask, deleteTask, undoActivity } from "./actions";
+import { CaptureBox } from "./CaptureBox";
 
 export default async function Home() {
   const session = await auth();
@@ -17,10 +23,11 @@ export default async function Home() {
     );
   }
 
-  const [tasks, deleted, activity] = await Promise.all([
+  const [tasks, deleted, activity, captureContext] = await Promise.all([
     getActiveTasks(),
     getDeletedTasks(),
     getRecentActivity(),
+    buildCaptureContext(),
   ]);
 
   const now = Date.now();
@@ -40,40 +47,44 @@ export default async function Home() {
       </header>
 
       <p className="mt-1 text-muted">
-        WP1 — every change below goes through the one write path and is reversible from the ledger.
+        WP2 — one typed line becomes many fields. What the app understood is echoed below in prose.
       </p>
 
       <section className="mt-8">
-        <form action={createTask} className="flex gap-2">
-          <input
-            name="title"
-            placeholder="Add a task"
-            autoFocus
-            className="flex-1 rounded border border-line bg-surface px-3 py-2 outline-none focus:border-accent"
-          />
-          <button className="rounded border border-line bg-surface px-3 py-2 hover:border-accent">
-            Add
-          </button>
-        </form>
+        <CaptureBox context={captureContext} />
 
-        <ul className="mt-4 flex flex-col gap-2">
+        <ul className="mt-6 flex flex-col gap-2">
           {tasks.length === 0 && <li className="text-muted">No tasks. Add one above.</li>}
-          {tasks.map((t) => (
-            <li key={t.id} className="flex items-center gap-2 border-b border-line py-2">
-              <form action={renameTask} className="flex flex-1 gap-2">
-                <input type="hidden" name="id" value={t.id} />
-                <input
-                  name="title"
-                  defaultValue={t.title}
-                  className="flex-1 bg-transparent outline-none focus:text-accent"
-                />
-              </form>
-              <form action={deleteTask}>
-                <input type="hidden" name="id" value={t.id} />
-                <button className="text-muted hover:text-text">Delete</button>
-              </form>
-            </li>
-          ))}
+          {tasks.map((t) => {
+            // State reads as words, never colour (invariant 7). A compact line
+            // of what capture stored, so the parse is visible after the write.
+            const facts: string[] = [t.kind];
+            if (t.dueDate) {
+              const d = t.dueDate.toISOString().slice(0, 10);
+              facts.push(`due ${d}${t.dueTime ? ` ${t.dueTime}` : ""}`);
+            }
+            if (t.doDate) facts.push(`do ${t.doDate.toISOString().slice(0, 10)}`);
+            if (t.estimateMinutes != null) facts.push(`${t.estimateMinutes}m`);
+            return (
+              <li key={t.id} className="flex items-center gap-2 border-b border-line py-2">
+                <div className="flex-1">
+                  <form action={renameTask} className="flex gap-2">
+                    <input type="hidden" name="id" value={t.id} />
+                    <input
+                      name="title"
+                      defaultValue={t.title}
+                      className="w-full bg-transparent outline-none focus:text-accent"
+                    />
+                  </form>
+                  <div className="text-xs text-muted">{facts.join(" · ")}</div>
+                </div>
+                <form action={deleteTask}>
+                  <input type="hidden" name="id" value={t.id} />
+                  <button className="text-muted hover:text-text">Delete</button>
+                </form>
+              </li>
+            );
+          })}
         </ul>
       </section>
 
