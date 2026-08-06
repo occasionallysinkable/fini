@@ -12,7 +12,7 @@ export default function SignInPage() {
         className="mt-6 flex flex-col gap-3"
         action={async (formData) => {
           "use server";
-          await signIn("nodemailer", {
+          await signIn("resend", {
             email: String(formData.get("email") ?? ""),
             redirectTo: "/",
           });
