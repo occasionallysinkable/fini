@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { parse, computeCaption, type ParseContext, type ShiftWindow } from "./parse";
+import {
+  parse,
+  computeCaption,
+  todayInZone,
+  weekdayOf,
+  describeKind,
+  type ParseContext,
+  type ShiftWindow,
+} from "./parse";
 
 /*
   WP2's correctness lives here. Every token in R16 has a case; every loosened
@@ -196,6 +204,13 @@ describe("R27 · the loosened spellings are mandatory", () => {
     expect(echo(r, "Estimate")).toContain("none given");
   });
 
+  it("echoes the estimate in words, not a terse unit", () => {
+    expect(echo(parse("A !35mins", ctx()), "Estimate")).toBe("35 minutes");
+    expect(echo(parse("A ~2h", ctx()), "Estimate")).toBe("2 hours");
+    expect(echo(parse("A ~90m", ctx()), "Estimate")).toBe("1 hour 30 minutes");
+    expect(echo(parse("A ~1m", ctx()), "Estimate")).toBe("1 minute");
+  });
+
   it("parses the real typed line from R27 end to end", () => {
     const r = parse(
       "Send updated email to MI before 8pm today asked !35mins @shannon",
@@ -207,6 +222,38 @@ describe("R27 · the loosened spellings are mandatory", () => {
     expect(r.estimateMinutes).toBe(35);
     expect(r.people[0]).toMatchObject({ name: "shannon", role: "asked_by" });
     expect(r.kind).toBe("commitment");
+  });
+});
+
+describe("invariant 10 · today resolves in the user's zone, not the UTC date", () => {
+  // An instant that is 6 Aug in UTC but already 7 Aug in a forward zone. This is
+  // exactly the machine-UTC-vs-local-date split that put the due date a day
+  // behind. Reading the UTC date here gives the wrong day.
+  const nearMidnightUTC = new Date("2026-08-06T23:30:00Z");
+
+  it("todayInZone reads the calendar date of the given zone", () => {
+    expect(todayInZone("UTC", nearMidnightUTC)).toBe("2026-08-06");
+    expect(todayInZone("Australia/Sydney", nearMidnightUTC)).toBe("2026-08-07");
+    expect(todayInZone("America/Los_Angeles", nearMidnightUTC)).toBe("2026-08-06");
+  });
+
+  it("the whole date family derives from the local today, not UTC", () => {
+    // Live in Sydney: it is Friday 7 August there, though UTC still says the 6th.
+    const today = todayInZone("Australia/Sydney", nearMidnightUTC);
+    expect(today).toBe("2026-08-07");
+    const c: ParseContext = {
+      today,
+      todayWeekday: weekdayOf(today), // Friday
+      defaultEstimateEnabled: true,
+      shifts: [],
+    };
+    expect(parse("x today", c).doDate).toBe("2026-08-07");
+    expect(parse("x tomorrow", c).doDate).toBe("2026-08-08");
+    expect(parse("x Friday", c).doDate).toBe("2026-08-07"); // today is Friday
+    expect(parse("x Saturday", c).doDate).toBe("2026-08-08");
+    expect(parse("x 8 Aug", c).doDate).toBe("2026-08-08");
+    // And a due time "today" lands on the local day, not the UTC one.
+    expect(parse("x before 8pm today", c).dueDate).toBe("2026-08-07");
   });
 });
 
@@ -237,6 +284,16 @@ describe("R17 · kind is inferred and the cause is printed", () => {
     const r = parse("Errand @sam:asked *own", ctx());
     expect(r.kind).toBe("own");
     expect(r.kindExplicit).toBe(true);
+  });
+
+  it("prints exactly one kind line, and it matches describeKind", () => {
+    const r = parse("Send figures @shannon:asked", ctx());
+    const kindLines = r.echo.filter((l) => l.field === "Kind");
+    expect(kindLines).toHaveLength(1);
+    expect(kindLines[0].text).toBe("commitment — because shannon asked");
+    // The component builds its single line from the same function, so the two
+    // can never disagree (the bug was two lines with different wording).
+    expect(describeKind(r.people, false, null)).toBe(kindLines[0].text);
   });
 });
 

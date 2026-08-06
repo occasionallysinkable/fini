@@ -1,5 +1,5 @@
 import { prisma } from "./prisma";
-import type { ParseContext, ShiftWindow } from "./parse";
+import { todayInZone, weekdayOf, type ParseContext, type ShiftWindow } from "./parse";
 
 /*
   The read layer. Components and routes call these instead of importing the
@@ -36,21 +36,6 @@ export function getTask(id: string) {
 // (so the echo can say "(new)"), the default-estimate setting, and the shift
 // windows the R15 caption checks a due time against.
 // ---------------------------------------------------------------------------
-
-const WEEKDAY_FROM_ISO = (iso: string): number => {
-  const [y, m, d] = iso.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
-};
-
-/** "YYYY-MM-DD" for `now` in the given IANA zone. en-CA formats as ISO. */
-function todayInZone(timezone: string, now = new Date()): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(now);
-}
 
 function hhmmToMinutes(hhmm: string | null | undefined): number | null {
   if (!hhmm) return null;
@@ -98,7 +83,7 @@ export async function buildCaptureContext(): Promise<ParseContext> {
 
   return {
     today,
-    todayWeekday: WEEKDAY_FROM_ISO(today),
+    todayWeekday: weekdayOf(today),
     knownProjects: projects.map((p) => p.name),
     knownPersons: persons.map((p) => p.name),
     defaultEstimateEnabled: settings.defaultEstimate?.enabled ?? true,
