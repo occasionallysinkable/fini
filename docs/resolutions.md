@@ -262,3 +262,21 @@ A chain block prints the word *deadline* under its title whenever the block is t
 | R25 | "Due time — required for reminders" | Required for the presets. Reminders fall back to 00:00 on the date. |
 | R26 | Chain blocks marked by a magenta edge alone | The word *deadline* prints beside it. |
 | R27 | One canonical spelling per field, and the default estimate off | Many spellings per field, all echoed the same way. The default estimate ships on. |
+| R28 | reminders.md gave `!` to the reminder token | `!` sets the estimate; `+` sets a reminder. |
+
+## Corrected by building the parser
+
+### R28 · The exclamation mark is the estimate, and the plus is the reminder
+
+R27 gave `!35mins` to the estimate. reminders.md had already given `!`
+to reminders. Both cannot hold.
+
+`!` sets the estimate. `+` sets a reminder. The estimate keeps the mark
+because `!35mins` is a line somebody actually typed without being
+taught it, and a mark people reach for on their own is worth more than
+one the app assigned. Reminders keep `+`, which R16 already specified
+and which reads correctly as adding something rather than qualifying
+the task.
+
+The sentence in reminders.md that gives `!` to reminders is wrong and
+is corrected by this.

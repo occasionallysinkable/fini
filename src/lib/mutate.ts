@@ -57,9 +57,13 @@ export interface Actor {
 //  - deleteRow: remove a row that a create added (reverses a create). Optional
 //               relations pointing at it are set null by the schema, so history
 //               rows survive with a dangling pointer rather than blocking.
+//  - deleteWhere: remove every row of a model matching a where clause. Needed
+//               to reverse a create that added rows to a composite-key table
+//               (e.g. task_person), which has no single `id` to name.
 export type UndoOp =
   | { action: "update"; model: ModelName; id: string; data: Record<string, unknown> }
-  | { action: "deleteRow"; model: ModelName; id: string };
+  | { action: "deleteRow"; model: ModelName; id: string }
+  | { action: "deleteWhere"; model: ModelName; where: Record<string, unknown> };
 
 export interface UndoPayload {
   ops: UndoOp[];
@@ -119,9 +123,12 @@ export async function applyUndoOps(tx: Tx, ops: UndoOp[]): Promise<void> {
     const delegate = MODELS[op.model](tx) as {
       update: (args: unknown) => Promise<unknown>;
       delete: (args: unknown) => Promise<unknown>;
+      deleteMany: (args: unknown) => Promise<unknown>;
     };
     if (op.action === "update") {
       await delegate.update({ where: { id: op.id }, data: op.data });
+    } else if (op.action === "deleteWhere") {
+      await delegate.deleteMany({ where: op.where });
     } else {
       await delegate.delete({ where: { id: op.id } });
     }

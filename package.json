@@ -15,7 +15,8 @@
     "prisma:deploy": "dotenv -e .env.local -- prisma migrate deploy",
     "prisma:studio": "dotenv -e .env.local -- prisma studio",
     "db:seed": "dotenv -e .env.local -- tsx prisma/seed.ts",
-    "db:roundtrip": "dotenv -e .env.local -- tsx scripts/roundtrip.ts"
+    "db:roundtrip": "dotenv -e .env.local -- tsx scripts/roundtrip.ts",
+    "db:capture-roundtrip": "dotenv -e .env.local -- tsx scripts/capture-roundtrip.ts"
   },
   "prisma": {
     "seed": "dotenv -e .env.local -- tsx prisma/seed.ts"

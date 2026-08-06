@@ -174,16 +174,16 @@ Capture is typed and fast, and a reminder has to be addable in the same breath a
 
 ### Typed, in quick add
 
-A bang and an offset. The parser already reads dates and times, so the reminder token is deliberately narrow: `!` followed by a duration and the word before, or by a bare time.
+A plus and an offset. The parser already reads dates and times, so the reminder token is deliberately narrow: `+` followed by a duration, or by a bare time. (This corrects an earlier draft that gave `!` to reminders. `!` sets the estimate and `+` sets a reminder — see R28.)
 
 | You type | You get |
 | --- | --- |
-| `Meds 10am !30m` | Due today at 10:00, one reminder thirty minutes before it. |
-| `Passport Thu 9am !1d !30m` | Two reminders, a day out and half an hour out. Any number of bangs. |
-| `Call the bank Fri !9am` | Due Friday with no hour. The bare time makes a reminder at 9:00 on the Friday and does not become the due time — a reminder is not a deadline. |
-| `Meds 10am !` | The bare bang means at the due time. The shortest way to arm anything. |
+| `Meds 10am +30m` | Due today at 10:00, one reminder thirty minutes before it. |
+| `Passport Thu 9am +1d +30m` | Two reminders, a day out and half an hour out. Any number of them. |
+| `Call the bank Fri +9am` | Due Friday with no hour. The bare time makes a reminder at 9:00 on the Friday and does not become the due time — a reminder is not a deadline. |
+| `Meds 10am +at` | `+at` means at the due time. The shortest way to arm anything. |
 
-Everything the parser reads is echoed back as chips under the field before you press return, so the reminder is visible rather than assumed. If you write `!30m` on a task with no time at all, the chip reads *needs a time* in magenta and the reminder is dropped on save — stated while you are still typing, not discovered three days later when nothing fired.
+Everything the parser reads is echoed back under the field before you press return, so the reminder is visible rather than assumed. If you write `+30m` on a task with no time at all, the echo reads *needs a time* and the reminder is dropped on save — stated while you are still typing, not discovered three days later when nothing fired.
 
 ### Tapped, on the task
 
