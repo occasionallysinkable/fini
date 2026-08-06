@@ -9,7 +9,7 @@ import { applyUndoOps, type Tx, type UndoOp } from "./mutate";
   `npm run db:roundtrip` once DATABASE_URL points at a real database.)
 */
 
-type Call = { model: string; method: "update" | "delete"; args: unknown };
+type Call = { model: string; method: "update" | "delete" | "deleteMany"; args: unknown };
 
 function stubTx() {
   const calls: Call[] = [];
@@ -20,6 +20,10 @@ function stubTx() {
     },
     delete: (args: unknown) => {
       calls.push({ model, method: "delete", args });
+      return Promise.resolve({});
+    },
+    deleteMany: (args: unknown) => {
+      calls.push({ model, method: "deleteMany", args });
       return Promise.resolve({});
     },
   });
@@ -56,6 +60,16 @@ describe("applyUndoOps", () => {
     await applyUndoOps(tx, [{ action: "deleteRow", model: "person", id: "p1" }]);
     expect(calls).toEqual([
       { model: "person", method: "delete", args: { where: { id: "p1" } } },
+    ]);
+  });
+
+  it("reverses a create on a composite-key table by deleting its rows by where", async () => {
+    const { tx, calls } = stubTx();
+    await applyUndoOps(tx, [
+      { action: "deleteWhere", model: "taskPerson", where: { taskId: "t1" } },
+    ]);
+    expect(calls).toEqual([
+      { model: "taskPerson", method: "deleteMany", args: { where: { taskId: "t1" } } },
     ]);
   });
 
