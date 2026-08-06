@@ -1,4 +1,5 @@
 import { prisma } from "./prisma";
+import type { ParseContext, ShiftWindow } from "./parse";
 
 /*
   The read layer. Components and routes call these instead of importing the
@@ -27,4 +28,113 @@ export function getRecentActivity() {
 
 export function getTask(id: string) {
   return prisma.task.findUnique({ where: { id } });
+}
+
+// ---------------------------------------------------------------------------
+// Capture (WP2). The parser is pure and needs a little context: today in the
+// user's zone (dates are dates — invariant 10), the names that already exist
+// (so the echo can say "(new)"), the default-estimate setting, and the shift
+// windows the R15 caption checks a due time against.
+// ---------------------------------------------------------------------------
+
+const WEEKDAY_FROM_ISO = (iso: string): number => {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+};
+
+/** "YYYY-MM-DD" for `now` in the given IANA zone. en-CA formats as ISO. */
+function todayInZone(timezone: string, now = new Date()): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+
+function hhmmToMinutes(hhmm: string | null | undefined): number | null {
+  if (!hhmm) return null;
+  const [h, m] = hhmm.split(":").map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  return h * 60 + m;
+}
+
+/**
+ * Build the parser's context from live data. Shifts come from the shift table
+ * once WP11 populates it; until then the app runs on the single implicit "Day"
+ * shift across the user's waking hours (R13/R14) — read from the user row, not
+ * hard-coded (invariant 12).
+ */
+export async function buildCaptureContext(): Promise<ParseContext> {
+  const [user, projects, persons, shifts] = await Promise.all([
+    prisma.user.findFirst(),
+    prisma.project.findMany({ select: { name: true } }),
+    prisma.person.findMany({ select: { name: true } }),
+    prisma.shift.findMany(),
+  ]);
+
+  const timezone = user?.timezone ?? "UTC";
+  const today = todayInZone(timezone);
+
+  const settings = (user?.settings ?? {}) as {
+    defaultEstimate?: { enabled?: boolean };
+  };
+
+  let shiftWindows: ShiftWindow[] = shifts.flatMap((sh) => {
+    const start = hhmmToMinutes(sh.startTime);
+    const end = hhmmToMinutes(sh.endTime);
+    if (start == null || end == null) return [];
+    return [{ name: sh.name, startMinutes: start, endMinutes: end, weekdays: sh.weekdays }];
+  });
+
+  // Fall back to the implicit Day shift when none are configured yet.
+  if (shiftWindows.length === 0) {
+    const start = hhmmToMinutes(user?.wakingStart) ?? 7 * 60;
+    const end = hhmmToMinutes(user?.wakingEnd) ?? 23 * 60;
+    shiftWindows = [
+      { name: "Day", startMinutes: start, endMinutes: end, weekdays: [true, true, true, true, true, true, true] },
+    ];
+  }
+
+  return {
+    today,
+    todayWeekday: WEEKDAY_FROM_ISO(today),
+    knownProjects: projects.map((p) => p.name),
+    knownPersons: persons.map((p) => p.name),
+    defaultEstimateEnabled: settings.defaultEstimate?.enabled ?? true,
+    shifts: shiftWindows,
+  };
+}
+
+/** Resolve a project path to ids, noting which levels need creating. */
+export async function resolveProjectPath(path: string[]): Promise<
+  { name: string; id: string; existing: boolean; parentId: string | null }[]
+> {
+  const out: { name: string; id: string; existing: boolean; parentId: string | null }[] = [];
+  let parentId: string | null = null;
+  for (const name of path) {
+    const found: { id: string } | null = await prisma.project.findFirst({
+      where: { name: { equals: name, mode: "insensitive" }, parentId },
+      select: { id: true },
+    });
+    if (found) {
+      out.push({ name, id: found.id, existing: true, parentId });
+      parentId = found.id;
+    } else {
+      const id = crypto.randomUUID();
+      out.push({ name, id, existing: false, parentId });
+      parentId = id;
+    }
+  }
+  return out;
+}
+
+/** Resolve a person by name, noting whether they need creating. */
+export async function resolvePerson(name: string): Promise<{ id: string; existing: boolean }> {
+  const found: { id: string } | null = await prisma.person.findFirst({
+    where: { name: { equals: name, mode: "insensitive" } },
+    select: { id: true },
+  });
+  if (found) return { id: found.id, existing: true };
+  return { id: crypto.randomUUID(), existing: false };
 }

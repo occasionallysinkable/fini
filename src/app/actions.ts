@@ -2,15 +2,14 @@
 
 import { revalidatePath } from "next/cache";
 import { auth } from "@/auth";
-import { mutate, undo } from "@/lib/mutate";
-import { getTask } from "@/lib/queries";
-
-/*
-  WP1 demonstration actions. They exist to prove the spine end to end:
-  every one goes through mutate(), every one writes an activity row, and each
-  is reversible from the ledger. This is not capture (that is WP2) — a task is
-  created from a bare title with no parsing.
-*/
+import { mutate, undo, type UndoOp } from "@/lib/mutate";
+import {
+  getTask,
+  buildCaptureContext,
+  resolveProjectPath,
+  resolvePerson,
+} from "@/lib/queries";
+import { parse, inferKind, type Role, type Kind } from "@/lib/parse";
 
 async function requireUser() {
   const session = await auth();
@@ -18,24 +17,132 @@ async function requireUser() {
   return session.user;
 }
 
-export async function createTask(formData: FormData) {
-  await requireUser();
-  const title = String(formData.get("title") ?? "").trim();
-  if (!title) return;
+// ---------------------------------------------------------------------------
+// WP2 · capture. The typed line is parsed (R16/R27), kind is inferred (R17),
+// and the task — with any new project or person it referenced — is created in
+// one mutate() call, so the whole capture reverses from a single ledger line.
+// ---------------------------------------------------------------------------
 
-  // Pre-generate the id so the undo payload is known before the write runs.
-  const id = crypto.randomUUID();
+function isoToDate(iso: string): Date {
+  return new Date(`${iso}T00:00:00.000Z`);
+}
+
+export interface CaptureState {
+  ok: boolean;
+  summary?: string;
+  error?: string;
+}
+
+export async function captureTask(
+  _prev: CaptureState,
+  formData: FormData
+): Promise<CaptureState> {
+  await requireUser();
+  const raw = String(formData.get("raw") ?? "").trim();
+  if (!raw) return { ok: false };
+
+  // Roles the user chose inline for people the parser left role-less (R16:
+  // "without a role it asks once"). Keyed by the person's typed name.
+  let roleChoices: Record<string, Role> = {};
+  try {
+    roleChoices = JSON.parse(String(formData.get("roles") ?? "{}"));
+  } catch {
+    roleChoices = {};
+  }
+
+  const ctx = await buildCaptureContext();
+  const p = parse(raw, ctx);
+
+  if (!p.title) {
+    return { ok: false, error: "Give the task a few words of its own — the rest were all fields." };
+  }
+
+  // Apply the inline role answers, then re-infer the kind (a chosen "asked"
+  // makes it a commitment).
+  const people = p.people.map((person) => ({
+    ...person,
+    role: person.role ?? roleChoices[person.name] ?? ("assignee" as Role),
+  }));
+  const kindInfo = p.kindExplicit
+    ? { kind: p.kind, explicit: true }
+    : inferKind(people, p.recurrence != null, null);
+  const kind: Kind = kindInfo.kind;
+
+  // Resolve the names to ids before the write, so the undo payload is known.
+  const projectLevels = p.project ? await resolveProjectPath(p.project.path) : [];
+  const leafProjectId = projectLevels.length ? projectLevels[projectLevels.length - 1].id : null;
+
+  const resolvedPeople = await Promise.all(
+    people.map(async (person) => ({
+      ...person,
+      ...(await resolvePerson(person.name)),
+    }))
+  );
+
+  const taskId = crypto.randomUUID();
+
+  // Reversal, in FK-safe order: links, then task, then anything this capture
+  // newly created (people, then projects leaf→root).
+  const undoOps: UndoOp[] = [
+    { action: "deleteWhere", model: "taskPerson", where: { taskId } },
+    { action: "deleteRow", model: "task", id: taskId },
+  ];
+  for (const person of resolvedPeople) {
+    if (!person.existing) undoOps.push({ action: "deleteRow", model: "person", id: person.id });
+  }
+  for (const level of [...projectLevels].reverse()) {
+    if (!level.existing) undoOps.push({ action: "deleteRow", model: "project", id: level.id });
+  }
 
   await mutate({
     actor: { kind: "user" },
-    verb: "task.create",
-    taskId: id,
-    summary: `Added “${title}”`,
-    undo: { ops: [{ action: "deleteRow", model: "task", id }] },
-    apply: (tx) => tx.task.create({ data: { id, title } }),
+    verb: "task.capture",
+    taskId,
+    summary: `Added “${p.title}”`,
+    undo: { ops: undoOps },
+    apply: async (tx) => {
+      for (const level of projectLevels) {
+        if (!level.existing) {
+          await tx.project.create({
+            data: { id: level.id, name: level.name, parentId: level.parentId },
+          });
+        }
+      }
+      for (const person of resolvedPeople) {
+        if (!person.existing) {
+          await tx.person.create({ data: { id: person.id, name: person.name } });
+        }
+      }
+      const task = await tx.task.create({
+        data: {
+          id: taskId,
+          title: p.title,
+          projectId: leafProjectId,
+          kind,
+          kindIsExplicit: p.kindExplicit,
+          reason: p.reason,
+          source: "typed",
+          doDate: p.doDate ? isoToDate(p.doDate) : null,
+          doDateSetBy: p.doDate ? "user" : null,
+          dueDate: p.dueDate ? isoToDate(p.dueDate) : null,
+          dueTime: p.dueTime,
+          deferUntil: p.deferUntil ? isoToDate(p.deferUntil) : null,
+          estimateMinutes: p.estimateGiven ? p.estimateMinutes : null,
+          splittable: p.chunking?.splittable ?? false,
+          minChunkMinutes: p.chunking?.minChunkMinutes ?? null,
+        },
+      });
+      for (const person of resolvedPeople) {
+        await tx.taskPerson.create({
+          data: { taskId, personId: person.id, role: person.role },
+        });
+      }
+      return task;
+    },
   });
 
   revalidatePath("/");
+  return { ok: true, summary: `Added “${p.title}”` };
 }
 
 export async function renameTask(formData: FormData) {
