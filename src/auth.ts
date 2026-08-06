@@ -1,6 +1,6 @@
 import NextAuth from "next-auth";
 import { PrismaAdapter } from "@auth/prisma-adapter";
-import Nodemailer from "next-auth/providers/nodemailer";
+import Resend from "next-auth/providers/resend";
 import { prismaBase } from "@/lib/prisma";
 
 /*
@@ -22,9 +22,9 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   // Database sessions — the canonical magic-link setup, and we have the table.
   session: { strategy: "database" },
   providers: [
-    Nodemailer({
-      server: process.env.EMAIL_SERVER,
-      from: process.env.EMAIL_FROM,
+    Resend({
+      apiKey: process.env.RESEND_API_KEY,
+      from: "onboarding@resend.dev",
     }),
   ],
   pages: {
