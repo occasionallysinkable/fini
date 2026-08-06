@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/*
+  The tokens file. Per the stack decision, this is the ONLY place a colour is
+  written down. No component may contain a hex value; every colour a component
+  uses is one of these custom properties (via Tailwind's generated utilities,
+  e.g. bg-surface, text-muted, or var(--color-*) directly).
+
+  Invariant 7 (state is words) still holds: colour only ever reinforces a word,
+  it never carries meaning on its own.
+*/
+@theme {
+  --color-bg: #0f1115;
+  --color-surface: #171a21;
+  --color-line: #262b36;
+  --color-text: #e7e9ee;
+  --color-muted: #99a0ad;
+  --color-accent: #7aa2ff;
+  /* Reserved for the chain's "deadline" mark in later packages (R26). Declared
+     here so no component ever writes the value itself. */
+  --color-deadline: #d6409f;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+}
