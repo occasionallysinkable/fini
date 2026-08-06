@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import type { Activity, ActivityFilterKind } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { inWrite } from "@/lib/write-context";
 
 /*
   The write spine (invariants 1 and 2).
@@ -87,8 +88,11 @@ export async function mutate<T>(
 ): Promise<{ result: T; activity: Activity }> {
   const undoExpiresAt = new Date(Date.now() + (input.undoTtlMs ?? DEFAULT_UNDO_TTL_MS));
 
-  return prisma.$transaction(async (tx) => {
-    const result = await input.apply(tx);
+  // inWrite marks this transaction as the sanctioned write path; the guard on
+  // the Prisma client lets these writes through and blocks every other one.
+  return inWrite(() =>
+    prisma.$transaction(async (tx) => {
+      const result = await input.apply(tx as unknown as Tx);
 
     const activity = await tx.activity.create({
       data: {
@@ -103,8 +107,9 @@ export async function mutate<T>(
       },
     });
 
-    return { result, activity };
-  });
+      return { result, activity };
+    })
+  );
 }
 
 // Run the reverse steps against a transaction. Exported so the reversal logic
@@ -130,7 +135,8 @@ export async function applyUndoOps(tx: Tx, ops: UndoOp[]): Promise<void> {
  * is itself a write).
  */
 export async function undo(activityId: string): Promise<Activity> {
-  return prisma.$transaction(async (tx) => {
+  return inWrite(() =>
+    prisma.$transaction(async (tx) => {
     const original = await tx.activity.findUnique({ where: { id: activityId } });
     if (!original) throw new Error(`No activity ${activityId}`);
     if (!original.undoExpiresAt || original.undoExpiresAt.getTime() < Date.now()) {
@@ -139,7 +145,7 @@ export async function undo(activityId: string): Promise<Activity> {
     const payload = original.undoPayload as unknown as UndoPayload | null;
     if (!payload?.ops?.length) throw new Error("This activity has no undo payload.");
 
-    await applyUndoOps(tx, payload.ops);
+    await applyUndoOps(tx as unknown as Tx, payload.ops);
 
     // Consume the window so the same activity cannot be undone again.
     await tx.activity.update({
@@ -167,5 +173,6 @@ export async function undo(activityId: string): Promise<Activity> {
         undoExpiresAt: null,
       },
     });
-  });
+    })
+  );
 }

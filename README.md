@@ -34,6 +34,23 @@ Vercel.
    (or add it to the build). The database persists across redeploys — Neon is
    separate from the Vercel build, so a redeploy never touches the data.
 
+## Enforcing the write path (invariant 1)
+
+`mutate()` being the only write path is enforced two ways, not by convention:
+
+- **Runtime.** `src/lib/prisma.ts` exports a *guarded* client. Any
+  create/update/delete made through it outside `mutate()`'s write context
+  throws before it reaches the database. `mutate()` marks its transaction with
+  an async-local flag (`src/lib/write-context.ts`); the guard lets those writes
+  through and blocks all others. The Auth.js adapter uses a separate unguarded
+  client for its own session/verification rows.
+- **Build time.** An ESLint rule (`eslint.config.mjs`) fails the build if
+  anything under `src/app` imports the Prisma client directly. Components read
+  through `src/lib/queries.ts` and write through `mutate()`, so the runtime
+  guard can never be reached past.
+
+`npm test` includes a test that a direct write throws.
+
 ## The invariants this package holds
 
 1. Every write goes through `src/lib/mutate.ts`, which also writes an `activity`

@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { auth, signOut } from "@/auth";
-import { prisma } from "@/lib/prisma";
+import { getActiveTasks, getDeletedTasks, getRecentActivity } from "@/lib/queries";
 import { createTask, renameTask, deleteTask, undoActivity } from "./actions";
 
 export default async function Home() {
@@ -18,9 +18,9 @@ export default async function Home() {
   }
 
   const [tasks, deleted, activity] = await Promise.all([
-    prisma.task.findMany({ where: { deletedAt: null }, orderBy: { createdAt: "desc" } }),
-    prisma.task.findMany({ where: { deletedAt: { not: null } }, orderBy: { modifiedAt: "desc" } }),
-    prisma.activity.findMany({ orderBy: { at: "desc" }, take: 30 }),
+    getActiveTasks(),
+    getDeletedTasks(),
+    getRecentActivity(),
   ]);
 
   const now = Date.now();
