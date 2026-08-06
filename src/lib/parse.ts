@@ -154,9 +154,25 @@ function addDays(iso: string, days: number): string {
   return ymd(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate());
 }
 
-function weekdayOf(iso: string): number {
+export function weekdayOf(iso: string): number {
   const [y, m, d] = iso.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
+/**
+ * "YYYY-MM-DD" for `now` in the given IANA zone. Invariant 10: a date is a
+ * calendar date with no zone, and "today" must resolve in the user's zone —
+ * never by reading the machine's UTC date, which is a day off whenever the
+ * local date and the UTC date differ. Intl does the zone maths; en-CA formats
+ * as ISO. This is the ONLY place "today" is turned into a date.
+ */
+export function todayInZone(timezone: string, now: Date = new Date()): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
 }
 
 /** Parse a bare date expression against `today`. Returns "YYYY-MM-DD" or null. */
@@ -264,6 +280,16 @@ function humanMinutes(min: number): string {
   return `${Math.floor(min / 60)}h ${min % 60}m`;
 }
 
+/** Estimate prose, in words to match the rest of the echo: "1 hour 30 minutes". */
+function humanEstimate(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  const parts: string[] = [];
+  if (h) parts.push(`${h} hour${h === 1 ? "" : "s"}`);
+  if (m) parts.push(`${m} minute${m === 1 ? "" : "s"}`);
+  return parts.length ? parts.join(" ") : "0 minutes";
+}
+
 /** "2026-08-07" → "Thursday 7 August". */
 function humanDate(iso: string): string {
   const [, m, d] = iso.split("-").map(Number);
@@ -300,15 +326,36 @@ export function inferKind(
   return { kind: "unassigned", explicit: false, cause: "" };
 }
 
+/**
+ * The full kind line — "commitment — because shannon asked" — from a set of
+ * people. One function so the parser's echo and the live capture box print the
+ * exact same words (there is exactly one kind line, R17).
+ */
+export function describeKind(
+  people: { name?: string; role: Role | null }[],
+  hasRecurrence: boolean,
+  explicitKind: Kind | null
+): string {
+  const info = inferKind(people, hasRecurrence, explicitKind);
+  const cause = info.explicit
+    ? "you set it"
+    : kindCauseWithNames(people, info.cause);
+  return `${info.kind}${cause ? ` — ${cause}` : " — nobody attached"}`;
+}
+
 // A richer cause that names the person, when we have one.
-function kindCauseWithNames(people: ParsedPerson[], base: string): string {
+function kindCauseWithNames(
+  people: { name?: string; role: Role | null }[],
+  base: string
+): string {
   const owed = people.find(
     (p) => p.role === "asked_by" || p.role === "delegated_to"
   );
   if (owed) {
+    const who = owed.name ?? "someone";
     return owed.role === "asked_by"
-      ? `because ${owed.name} asked`
-      : `because it was delegated to ${owed.name}`;
+      ? `because ${who} asked`
+      : `because it was delegated to ${who}`;
   }
   return base;
 }
@@ -724,7 +771,7 @@ function buildEcho(i: EchoInput): EchoLine[] {
   }
 
   if (i.estimateGiven && i.estimateMinutes != null) {
-    lines.push({ field: "Estimate", text: humanMinutes(i.estimateMinutes) });
+    lines.push({ field: "Estimate", text: humanEstimate(i.estimateMinutes) });
   } else if (i.defaultEstimateEnabled) {
     // R27: announce the empty estimate in the same list as everything else.
     lines.push({

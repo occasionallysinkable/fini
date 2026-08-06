@@ -1,7 +1,14 @@
 "use client";
 
 import { useActionState, useMemo, useState } from "react";
-import { parse, inferKind, type ParseContext, type Role } from "@/lib/parse";
+import {
+  parse,
+  describeKind,
+  todayInZone,
+  weekdayOf,
+  type ParseContext,
+  type Role,
+} from "@/lib/parse";
 import { captureTask, type CaptureState } from "./actions";
 
 /*
@@ -33,16 +40,34 @@ export function CaptureBox({ context }: { context: ParseContext }) {
     { ok: false }
   );
 
-  const parsed = useMemo(() => parse(raw, context), [raw, context]);
+  // "Today" resolves in this browser's zone (invariant 10), so the echo shows
+  // the day the user is actually living even when the server runs in UTC. The
+  // same zone rides along on submit so the stored date matches.
+  const local = useMemo(() => {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const today = todayInZone(tz);
+    return { tz, today, weekday: weekdayOf(today) };
+  }, []);
+  const effectiveContext: ParseContext = useMemo(
+    () => ({ ...context, today: local.today, todayWeekday: local.weekday }),
+    [context, local]
+  );
+
+  const parsed = useMemo(() => parse(raw, effectiveContext), [raw, effectiveContext]);
 
   // People needing a role, after the user's inline answers are applied.
   const peopleResolved = parsed.people.map((p) => ({
     ...p,
     role: p.role ?? roles[p.name] ?? null,
   }));
-  const liveKind = parsed.kindExplicit
-    ? { kind: parsed.kind, cause: "you set it" }
-    : inferKind(peopleResolved, parsed.recurrence != null, null);
+
+  // One kind line, computed from the resolved roles so it updates as the user
+  // answers the inline role question. Same words the parser's echo would print.
+  const kindText = describeKind(
+    peopleResolved,
+    parsed.recurrence != null,
+    parsed.kindExplicit ? parsed.kind : null
+  );
 
   const needRole = peopleResolved.filter((p) => p.role === null);
   const showEcho = raw.trim().length > 0;
@@ -53,6 +78,7 @@ export function CaptureBox({ context }: { context: ParseContext }) {
         action={(fd) => {
           fd.set("raw", raw);
           fd.set("roles", JSON.stringify(roles));
+          fd.set("tz", local.tz);
           formAction(fd);
           setRaw("");
           setRoles({});
@@ -74,11 +100,15 @@ export function CaptureBox({ context }: { context: ParseContext }) {
               Title — <span className="text-text">{parsed.title || "…"}</span>
             </div>
 
-            {parsed.echo.map((line, idx) => (
-              <div key={idx} className="text-muted">
-                {line.field} — <span className="text-text">{line.text}</span>
-              </div>
-            ))}
+            {/* Kind is rendered once, below, from the resolved roles — so it is
+                filtered out of the parser's echo here to avoid a second line. */}
+            {parsed.echo
+              .filter((line) => line.field !== "Kind")
+              .map((line, idx) => (
+                <div key={idx} className="text-muted">
+                  {line.field} — <span className="text-text">{line.text}</span>
+                </div>
+              ))}
 
             {/* R15: one caption when a due time is outside every shift. */}
             {parsed.caption && (
@@ -109,13 +139,9 @@ export function CaptureBox({ context }: { context: ParseContext }) {
               </div>
             ))}
 
-            {/* R17: the kind inference, live, with its cause. */}
+            {/* R17: the kind inference, printed once, live, with its cause. */}
             <div className="mt-1 text-muted">
-              Kind —{" "}
-              <span className="text-text">
-                {liveKind.kind}
-                {liveKind.cause ? ` · ${liveKind.cause}` : " · nobody attached"}
-              </span>
+              Kind — <span className="text-text">{kindText}</span>
             </div>
           </div>
         )}
