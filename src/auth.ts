@@ -1,7 +1,7 @@
 import NextAuth from "next-auth";
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import Nodemailer from "next-auth/providers/nodemailer";
-import { prisma } from "@/lib/prisma";
+import { prismaBase } from "@/lib/prisma";
 
 /*
   Single-user auth. Email magic link, and an allowlist of exactly one address.
@@ -15,7 +15,10 @@ import { prisma } from "@/lib/prisma";
 const allowed = (process.env.ALLOWED_EMAIL ?? "").trim().toLowerCase();
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
-  adapter: PrismaAdapter(prisma),
+  // The adapter uses the unguarded client: sign-in must write its own
+  // session/account/verification rows, which are auth plumbing, not domain
+  // mutations. Every domain write still goes through the guarded client.
+  adapter: PrismaAdapter(prismaBase),
   // Database sessions — the canonical magic-link setup, and we have the table.
   session: { strategy: "database" },
   providers: [

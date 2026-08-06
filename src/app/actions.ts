@@ -2,8 +2,8 @@
 
 import { revalidatePath } from "next/cache";
 import { auth } from "@/auth";
-import { prisma } from "@/lib/prisma";
 import { mutate, undo } from "@/lib/mutate";
+import { getTask } from "@/lib/queries";
 
 /*
   WP1 demonstration actions. They exist to prove the spine end to end:
@@ -44,7 +44,7 @@ export async function renameTask(formData: FormData) {
   const title = String(formData.get("title") ?? "").trim();
   if (!id || !title) return;
 
-  const before = await prisma.task.findUnique({ where: { id } });
+  const before = await getTask(id);
   if (!before) return;
 
   await mutate({
@@ -62,7 +62,7 @@ export async function renameTask(formData: FormData) {
 export async function deleteTask(formData: FormData) {
   await requireUser();
   const id = String(formData.get("id"));
-  const before = await prisma.task.findUnique({ where: { id } });
+  const before = await getTask(id);
   if (!before || before.deletedAt) return;
 
   // A delete sets deletedAt and nothing else (invariant 2).
