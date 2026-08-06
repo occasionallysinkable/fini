@@ -1,7 +1,7 @@
 import { Prisma } from "@prisma/client";
 import type { Activity, ActivityFilterKind } from "@prisma/client";
-import { prisma } from "@/lib/prisma";
-import { inWrite } from "@/lib/write-context";
+import { prisma } from "./prisma";
+import { inWrite } from "./write-context";
 
 /*
   The write spine (invariants 1 and 2).
