@@ -683,6 +683,18 @@ export function parse(raw: string, ctx: ParseContext): ParseResult {
 // R15 — one caption when a due time falls outside every shift on its date.
 // ---------------------------------------------------------------------------
 
+/**
+ * Is a minute-of-day inside a window? Handles the two R29 cases:
+ *  - start === end is the whole day (waking hours default to 00:00–00:00), so
+ *    everything is inside and R15 never speaks.
+ *  - a window may cross midnight (11:00–03:00), so "inside" wraps.
+ */
+function withinWindow(mins: number, start: number, end: number): boolean {
+  if (start === end) return true; // full day
+  if (start < end) return mins >= start && mins < end;
+  return mins >= start || mins < end; // crosses midnight
+}
+
 export function computeCaption(
   dueDate: string | null,
   dueTime: string | null,
@@ -696,8 +708,8 @@ export function computeCaption(
   const mins = timeToMinutes(dueTime);
   const onThatDay = shifts.filter((sh) => sh.weekdays[wd]);
   if (onThatDay.length === 0) return null;
-  const inside = onThatDay.some(
-    (sh) => mins >= sh.startMinutes && mins < sh.endMinutes
+  const inside = onThatDay.some((sh) =>
+    withinWindow(mins, sh.startMinutes, sh.endMinutes)
   );
   if (inside) return null;
   return `${dueTime} is outside your shifts on ${WEEKDAY_NAMES[wd]}`;
