@@ -257,6 +257,55 @@ describe("invariant 10 · today resolves in the user's zone, not the UTC date", 
   });
 });
 
+describe("a deadline preposition claims the whole date-and-time phrase", () => {
+  it("claims a date + time in either order", () => {
+    const a = parse("Send it before 8pm next sunday", ctx());
+    expect(a.dueDate).toBe("2026-08-09"); // next Sunday from Friday
+    expect(a.dueTime).toBe("20:00");
+    expect(a.dueKeyword).toBe("before");
+    expect(a.doDate).toBeNull();
+    expect(a.title).toBe("Send it");
+
+    const b = parse("Send it before next sunday 8pm", ctx());
+    expect(b.dueDate).toBe("2026-08-09");
+    expect(b.dueTime).toBe("20:00");
+    expect(b.doDate).toBeNull();
+    expect(b.title).toBe("Send it");
+  });
+
+  it("handles due 3 Sep 17:00 and by Friday at 9am", () => {
+    const c = parse("File it due 3 Sep 17:00", ctx());
+    expect(c.dueDate).toBe("2026-09-03");
+    expect(c.dueTime).toBe("17:00");
+
+    const d = parse("Call by Friday at 9am", ctx()); // today is Friday
+    expect(d.dueDate).toBe("2026-08-07");
+    expect(d.dueTime).toBe("09:00");
+    expect(d.dueKeyword).toBe("by");
+    expect(d.doDate).toBeNull();
+  });
+
+  it("sets no do date when a deadline preposition is present", () => {
+    const r = parse(
+      "Send updated email to MI before 8pm next sunday asked !35mins @shannon",
+      ctx()
+    );
+    expect(r.title).toBe("Send updated email to MI");
+    expect(r.dueDate).toBe("2026-08-09");
+    expect(r.dueTime).toBe("20:00");
+    expect(r.doDate).toBeNull();
+    expect(r.estimateMinutes).toBe(35);
+    expect(r.people[0]).toMatchObject({ name: "shannon", role: "asked_by" });
+    expect(r.kind).toBe("commitment");
+  });
+
+  it("consumes 'next' so it never survives into the title", () => {
+    const r = parse("Water plants next sunday", ctx());
+    expect(r.doDate).toBe("2026-08-09");
+    expect(r.title).toBe("Water plants");
+  });
+});
+
 describe("R17 · kind is inferred and the cause is printed", () => {
   it("asked-by makes it a commitment, naming the person", () => {
     const r = parse("Send figures @sam:asked", ctx());
