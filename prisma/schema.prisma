@@ -200,6 +200,11 @@ model Category {
 model Task {
   id             String      @id @default(cuid())
   title          String
+  // WP3 — explicit order of a task within its project. Sequence projects offer
+  // their first unfinished step, and "first" means lowest position, not oldest
+  // row: ordering by createdAt could neither insert a step into the middle nor
+  // reorder steps. WP4's board and WP8's recurrence read this same order.
+  position       Int         @default(0)
   projectId      String?     @map("project_id")
   categoryId     String?     @map("category_id")
   kind           TaskKind    @default(unassigned)
