@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { todayInZone, weekdayOf, type ParseContext, type ShiftWindow } from "./parse";
 import { isAvailable } from "./availability";
 import { isReviewDue } from "./review";
+import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
 
 /*
   The read layer. Components and routes call these instead of importing the
@@ -125,6 +126,128 @@ export async function getAvailableTasks() {
       today
     )
   );
+}
+
+// ---------------------------------------------------------------------------
+// WP4 · the board. Reads all the board and its search need in one round: every
+// active task (the board shows all of them, available or not — it is for
+// organising and retrieval, not the day), the finished tasks and notes and
+// projects that search also reaches, and the saved views strip. Rows are shaped
+// into BoardTask (strings, not Date objects) here so the client component
+// receives a plain, serialisable payload.
+// ---------------------------------------------------------------------------
+
+function ymd(d: Date | null): string | null {
+  return d ? d.toISOString().slice(0, 10) : null;
+}
+
+type TaskWithProject = {
+  id: string;
+  title: string;
+  projectId: string | null;
+  project: { name: string } | null;
+  kind: string;
+  status: string;
+  dueDate: Date | null;
+  dueTime: string | null;
+  doDate: Date | null;
+  deferUntil: Date | null;
+  estimateMinutes: number | null;
+  recurrenceRuleId: string | null;
+  createdAt: Date;
+};
+
+function toBoardTask(t: TaskWithProject): BoardTask {
+  return {
+    id: t.id,
+    title: t.title,
+    projectId: t.projectId,
+    projectName: t.project?.name ?? null,
+    kind: t.kind,
+    status: t.status,
+    dueDate: ymd(t.dueDate),
+    dueTime: t.dueTime,
+    doDate: ymd(t.doDate),
+    deferUntil: ymd(t.deferUntil),
+    estimateMinutes: t.estimateMinutes,
+    recurring: t.recurrenceRuleId != null,
+    createdAt: t.createdAt.toISOString(),
+  };
+}
+
+export interface SavedViewRow {
+  id: string;
+  name: string;
+  columns: ColumnId[];
+  grouping: GroupKey[];
+  sort: Sort;
+  filter: string[];
+}
+
+export interface BoardData {
+  active: BoardTask[];
+  completed: BoardTask[];
+  projects: { id: string; name: string }[];
+  notes: { id: string; body: string; taskId: string | null }[];
+  savedViews: SavedViewRow[];
+}
+
+export async function getBoardData(): Promise<BoardData> {
+  const withProject = {
+    include: { project: { select: { name: true } } },
+    orderBy: [{ position: "asc" as const }, { createdAt: "asc" as const }],
+  };
+  const [active, completed, projects, notes, savedViews] = await Promise.all([
+    prisma.task.findMany({ where: { deletedAt: null, status: "active" }, ...withProject }),
+    prisma.task.findMany({
+      where: { deletedAt: null, status: { in: ["done", "cancelled"] } },
+      ...withProject,
+    }),
+    prisma.project.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+    prisma.note.findMany({
+      select: { id: true, body: true, taskId: true },
+      orderBy: { createdAt: "desc" },
+    }),
+    prisma.savedView.findMany({ orderBy: [{ position: "asc" }, { name: "asc" }] }),
+  ]);
+
+  return {
+    active: active.map(toBoardTask),
+    completed: completed.map(toBoardTask),
+    projects,
+    notes,
+    savedViews: savedViews.map((v) => ({
+      id: v.id,
+      name: v.name,
+      columns: (v.columns as ColumnId[]) ?? [],
+      grouping: (v.grouping as GroupKey[]) ?? [],
+      sort: (v.sort as unknown as Sort) ?? { field: "due", dir: "asc" },
+      filter: (v.filter as string[]) ?? [],
+    })),
+  };
+}
+
+/** The tasks named by a bulk selection, with just the fields an undo payload
+ *  needs to restore. Reads go through the vetted lib layer, never app code. */
+export function getTasksByIds(ids: string[]) {
+  return prisma.task.findMany({
+    where: { id: { in: ids }, deletedAt: null },
+    select: {
+      id: true,
+      title: true,
+      kind: true,
+      kindIsExplicit: true,
+      projectId: true,
+      estimateMinutes: true,
+      pushCount: true,
+    },
+  });
+}
+
+/** The next position for the saved-views strip (appended to the end). */
+export async function nextSavedViewPosition(): Promise<number> {
+  const agg = await prisma.savedView.aggregate({ _max: { position: true } });
+  return (agg._max.position ?? -1) + 1;
 }
 
 /** Notes that stand alone (attached to no task), newest first. */
