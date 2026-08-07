@@ -117,7 +117,7 @@ const WEEKDAYS =
   "sat(?:urday)?|sun(?:day)?";
 const DAYNUM = "\\d{1,2}(?:st|nd|rd|th)?";
 const DATE_EXPR =
-  `(?:tomorrow|today|(?:${WEEKDAYS})|` +
+  `(?:tomorrow|today|(?:next\\s+)?(?:${WEEKDAYS})|` +
   `(?:${DAYNUM}\\s+(?:of\\s+)?(?:${MONTHS}))|` +
   `(?:(?:${MONTHS})\\s+${DAYNUM}))`;
 const TIME_EXPR = "(?:\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)|\\d{1,2}:\\d{2})";
@@ -182,12 +182,14 @@ function parseDate(expr: string, ctx: ParseContext): string | null {
   if (s === "today") return ctx.today;
   if (s === "tomorrow") return addDays(ctx.today, 1);
 
-  // A weekday name → its next occurrence. R27: a weekday that names today
-  // means today, not the same day next week.
-  const wd = s.slice(0, 3);
-  if (wd in WEEKDAY_INDEX && s.replace(/[a-z]/g, "").length === 0) {
-    const target = WEEKDAY_INDEX[wd];
-    const diff = (target - ctx.todayWeekday + 7) % 7; // 0 → today
+  // A weekday name → its next occurrence. R27: a plain weekday that names today
+  // means today. "next <weekday>" means the coming one, and when it names
+  // today it is a week away, not today.
+  const wdMatch = s.match(new RegExp(`^(next\\s+)?(${WEEKDAYS})$`));
+  if (wdMatch) {
+    const target = WEEKDAY_INDEX[wdMatch[2].slice(0, 3)];
+    let diff = (target - ctx.todayWeekday + 7) % 7; // 0 → today
+    if (wdMatch[1] && diff === 0) diff = 7; // "next" + today's weekday
     return addDays(ctx.today, diff);
   }
 
@@ -240,25 +242,58 @@ function parseTime(expr: string): string | null {
   return null;
 }
 
-/** From a datetime span like "3 Sep 17:00" or "8pm today", pull date and time. */
-function parseDateTime(
-  span: string,
+/**
+ * From the text right after a deadline preposition, greedily consume a date
+ * and/or a time, in either order, with an optional "at" before the time. This
+ * is what lets a preposition claim the WHOLE phrase — "before 8pm next sunday",
+ * "before next sunday 8pm", "by Friday at 9am" — rather than only the first
+ * token, which is what left a date behind to become a stray do date.
+ *
+ * Returns the date, the time, and how many characters were consumed (up to the
+ * last token that matched — trailing whitespace is not consumed).
+ */
+function consumeDateTime(
+  after: string,
   ctx: ParseContext
-): { date: string | null; time: string | null } {
+): { date: string | null; time: string | null; consumed: number } {
+  const dateRe = new RegExp(`^(${DATE_EXPR})`, "i");
+  const timeRe = new RegExp(`^(?:at\\s+)?(${TIME_EXPR})`, "i");
   let date: string | null = null;
   let time: string | null = null;
+  let idx = 0;
+  let consumed = 0;
 
-  const timeMatch = span.match(new RegExp(TIME_EXPR, "i"));
-  if (timeMatch) time = parseTime(timeMatch[0]);
+  for (;;) {
+    const ws = after.slice(idx).match(/^\s*/);
+    const afterWs = idx + (ws ? ws[0].length : 0);
+    const rest = after.slice(afterWs);
 
-  // Strip the time out before looking for a date, so "8pm" is not read as a day.
-  const withoutTime = timeMatch
-    ? span.replace(timeMatch[0], " ").trim()
-    : span.trim();
-  const dateMatch = withoutTime.match(new RegExp(DATE_EXPR, "i"));
-  if (dateMatch) date = parseDate(dateMatch[0], ctx);
+    if (time === null) {
+      const t = rest.match(timeRe);
+      if (t) {
+        const parsed = parseTime(t[1]);
+        if (parsed) {
+          time = parsed;
+          idx = consumed = afterWs + t[0].length;
+          continue;
+        }
+      }
+    }
+    if (date === null) {
+      const d = rest.match(dateRe);
+      if (d) {
+        const parsed = parseDate(d[1], ctx);
+        if (parsed) {
+          date = parsed;
+          idx = consumed = afterWs + d[0].length;
+          continue;
+        }
+      }
+    }
+    break;
+  }
 
-  return { date, time };
+  return { date, time, consumed };
 }
 
 function durationToMinutes(numStr: string, unit: string): number {
@@ -546,23 +581,27 @@ export function parse(raw: string, ctx: ParseContext): ParseResult {
     remove(estBare[0], estBare.index!);
   }
 
-  // 10. Due date + time carried by a preposition (R27: four of them).
+  // 10. A deadline preposition (R27: four of them) claims the WHOLE date-and-time
+  // phrase that follows it, in either order. Consuming the whole phrase is what
+  // keeps its date from being left behind and misread as a do date, and what
+  // stops a word like "next" surviving into the title (invariant 13).
   let dueDate: string | null = null;
   let dueTime: string | null = null;
   let dueKeyword: string | null = null;
-  const DATETIME =
-    `(?:(?:${DATE_EXPR})(?:\\s+(?:${TIME_EXPR}))?|(?:${TIME_EXPR})(?:\\s+(?:${DATE_EXPR}))?)`;
-  const dueMatch = s.match(
-    new RegExp(`\\b(by|before|due|no later than)\\s+(${DATETIME})`, "i")
-  );
-  if (dueMatch) {
-    dueKeyword = dueMatch[1].toLowerCase();
-    const { date, time } = parseDateTime(dueMatch[2], ctx);
-    dueDate = date;
-    dueTime = time;
-    // A due time with no date means today (R27: an hour is a deadline).
-    if (dueTime && !dueDate) dueDate = ctx.today;
-    remove(dueMatch[0], dueMatch.index!);
+  const dueKw = s.match(/\b(by|before|due|no later than)\s+/i);
+  if (dueKw) {
+    const phraseStart = dueKw.index! + dueKw[0].length;
+    const { date, time, consumed } = consumeDateTime(s.slice(phraseStart), ctx);
+    // Only claim the preposition if a real date or time followed it — otherwise
+    // "before lunch" is just words and stays in the title.
+    if (date || time) {
+      dueKeyword = dueKw[1].toLowerCase();
+      dueDate = date;
+      dueTime = time;
+      // A due time with no date means today (R27: an hour is a deadline).
+      if (dueTime && !dueDate) dueDate = ctx.today;
+      s = s.slice(0, dueKw.index!) + " " + s.slice(phraseStart + consumed);
+    }
   }
 
   // 11. A bare hour is a due time today (R27). 'at 15:30' or '9am' or '8pm today'.
