@@ -8,7 +8,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
   app; here we pin the shape of the write.
 */
 
-const mutateMock = vi.fn(async (_input: unknown) => ({ activity: { id: "act-1" } }));
+const mutateMock = vi.fn(async (input: unknown) => {
+  void input; // param typed so mock.calls is inspectable; not otherwise used
+  return { activity: { id: "act-1" } };
+});
 const getTasksByIdsMock = vi.fn();
 const getProjectByIdMock = vi.fn();
 
