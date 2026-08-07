@@ -209,6 +209,7 @@ export async function undoActivity(formData: FormData) {
   revalidatePath("/");
   revalidatePath("/projects");
   revalidatePath("/review");
+  revalidatePath("/board");
 }
 
 // ---------------------------------------------------------------------------
