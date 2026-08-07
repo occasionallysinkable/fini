@@ -5,6 +5,8 @@ import { auth } from "@/auth";
 import { mutate, undo, type UndoOp } from "@/lib/mutate";
 import {
   getTask,
+  getProjectById,
+  nextTaskPosition,
   buildCaptureContext,
   resolveProjectPath,
   resolvePerson,
@@ -90,6 +92,8 @@ export async function captureTask(
   );
 
   const taskId = crypto.randomUUID();
+  // A new task lands at the end of its project's order (WP3 position).
+  const position = await nextTaskPosition(leafProjectId);
 
   // Reversal, in FK-safe order: links, then task, then anything this capture
   // newly created (people, then projects leaf→root).
@@ -127,6 +131,7 @@ export async function captureTask(
         data: {
           id: taskId,
           title: p.title,
+          position,
           projectId: leafProjectId,
           kind,
           kindIsExplicit: p.kindExplicit,
@@ -202,4 +207,157 @@ export async function undoActivity(formData: FormData) {
   if (!id) return;
   await undo(id);
   revalidatePath("/");
+  revalidatePath("/projects");
+  revalidatePath("/review");
+}
+
+// ---------------------------------------------------------------------------
+// WP3 · projects, sub-projects, notes, review. Every write goes through
+// mutate() (invariant 1) with an undo payload that restores the prior state
+// (invariant 2). Two levels in the interface is a UI constraint (R20); these
+// actions accept any parentId, and the projects page only offers a child under
+// a top-level project.
+// ---------------------------------------------------------------------------
+
+export async function createProject(formData: FormData) {
+  await requireUser();
+  const name = String(formData.get("name") ?? "").trim();
+  if (!name) return;
+  const parentId = String(formData.get("parentId") ?? "").trim() || null;
+
+  const id = crypto.randomUUID();
+  await mutate({
+    actor: { kind: "user" },
+    verb: "project.create",
+    summary: parentId ? `Added sub-project “${name}”` : `Added project “${name}”`,
+    undo: { ops: [{ action: "deleteRow", model: "project", id }] },
+    apply: (tx) => tx.project.create({ data: { id, name, parentId } }),
+  });
+
+  revalidatePath("/projects");
+  revalidatePath("/");
+}
+
+export async function toggleProjectHold(formData: FormData) {
+  await requireUser();
+  const id = String(formData.get("id"));
+  const before = await getProjectById(id);
+  if (!before) return;
+  const onHold = !before.onHold;
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "project.hold",
+    summary: `${onHold ? "Put" : "Took"} “${before.name}” ${onHold ? "on hold" : "off hold"}`,
+    undo: { ops: [{ action: "update", model: "project", id, data: { onHold: before.onHold } }] },
+    apply: (tx) => tx.project.update({ where: { id }, data: { onHold } }),
+  });
+
+  revalidatePath("/projects");
+  revalidatePath("/");
+}
+
+export async function toggleProjectSequence(formData: FormData) {
+  await requireUser();
+  const id = String(formData.get("id"));
+  const before = await getProjectById(id);
+  if (!before) return;
+  const isSequence = !before.isSequence;
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "project.sequence",
+    summary: `“${before.name}” is ${isSequence ? "now a sequence" : "no longer a sequence"}`,
+    undo: { ops: [{ action: "update", model: "project", id, data: { isSequence: before.isSequence } }] },
+    apply: (tx) => tx.project.update({ where: { id }, data: { isSequence } }),
+  });
+
+  revalidatePath("/projects");
+  revalidatePath("/");
+}
+
+export async function setReviewInterval(formData: FormData) {
+  await requireUser();
+  const id = String(formData.get("id"));
+  const before = await getProjectById(id);
+  if (!before) return;
+
+  const raw = String(formData.get("days") ?? "").trim();
+  const parsed = raw === "" ? null : Number.parseInt(raw, 10);
+  const days = parsed != null && Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "project.reviewInterval",
+    summary: days
+      ? `Review “${before.name}” every ${days} day${days === 1 ? "" : "s"}`
+      : `Cleared the review interval on “${before.name}”`,
+    undo: {
+      ops: [
+        {
+          action: "update",
+          model: "project",
+          id,
+          data: { reviewIntervalDays: before.reviewIntervalDays },
+        },
+      ],
+    },
+    apply: (tx) => tx.project.update({ where: { id }, data: { reviewIntervalDays: days } }),
+  });
+
+  revalidatePath("/projects");
+  revalidatePath("/review");
+}
+
+/**
+ * Mark a project reviewed: reset its clock (decisions line 312). The write goes
+ * through mutate() like everything else, so the review leaves an activity row
+ * and undoes back to the previous last-reviewed timestamp.
+ */
+export async function markProjectReviewed(formData: FormData) {
+  await requireUser();
+  const id = String(formData.get("id"));
+  const before = await getProjectById(id);
+  if (!before) return;
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "project.reviewed",
+    summary: `Reviewed “${before.name}”`,
+    undo: {
+      ops: [
+        {
+          action: "update",
+          model: "project",
+          id,
+          data: { lastReviewedAt: before.lastReviewedAt },
+        },
+      ],
+    },
+    apply: (tx) => tx.project.update({ where: { id }, data: { lastReviewedAt: new Date() } }),
+  });
+
+  revalidatePath("/review");
+  revalidatePath("/projects");
+}
+
+/** Add a note. Stands alone when no taskId is given, or attaches to a task. */
+export async function addNote(formData: FormData) {
+  await requireUser();
+  const body = String(formData.get("body") ?? "").trim();
+  if (!body) return;
+  const taskId = String(formData.get("taskId") ?? "").trim() || null;
+
+  const id = crypto.randomUUID();
+  await mutate({
+    actor: { kind: "user" },
+    verb: "note.create",
+    taskId,
+    summary: taskId ? "Added a note to a task" : "Added a standalone note",
+    undo: { ops: [{ action: "deleteRow", model: "note", id }] },
+    apply: (tx) => tx.note.create({ data: { id, body, taskId } }),
+  });
+
+  revalidatePath("/");
+  revalidatePath("/projects");
 }

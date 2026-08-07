@@ -16,7 +16,8 @@
     "prisma:studio": "dotenv -e .env.local -- prisma studio",
     "db:seed": "dotenv -e .env.local -- tsx prisma/seed.ts",
     "db:roundtrip": "dotenv -e .env.local -- tsx scripts/roundtrip.ts",
-    "db:capture-roundtrip": "dotenv -e .env.local -- tsx scripts/capture-roundtrip.ts"
+    "db:capture-roundtrip": "dotenv -e .env.local -- tsx scripts/capture-roundtrip.ts",
+    "db:wp3-roundtrip": "dotenv -e .env.local -- tsx scripts/wp3-roundtrip.ts"
   },
   "prisma": {
     "seed": "dotenv -e .env.local -- tsx prisma/seed.ts"
