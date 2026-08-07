@@ -1,5 +1,7 @@
 import { prisma } from "./prisma";
 import { todayInZone, weekdayOf, type ParseContext, type ShiftWindow } from "./parse";
+import { isAvailable } from "./availability";
+import { isReviewDue } from "./review";
 
 /*
   The read layer. Components and routes call these instead of importing the
@@ -28,6 +30,141 @@ export function getRecentActivity() {
 
 export function getTask(id: string) {
   return prisma.task.findUnique({ where: { id } });
+}
+
+// ---------------------------------------------------------------------------
+// WP3 · projects, sub-projects, notes, availability, review.
+// ---------------------------------------------------------------------------
+
+/** "Today" as a date in the user's own zone (invariant 10). */
+async function todayForUser(): Promise<string> {
+  const user = await prisma.user.findFirst({ select: { timezone: true } });
+  return todayInZone(user?.timezone ?? "UTC");
+}
+
+/**
+ * The project tree for the interface: top-level projects, each with their
+ * direct children and the tasks of both, tasks ordered by createdAt (the
+ * sequence order — invariant, no position column). The UI renders two levels
+ * (R20); the data may nest deeper, and that depth is simply not drawn.
+ */
+export function getProjectTree() {
+  const tasksArg = {
+    where: { deletedAt: null },
+    // Sequence order is position, then createdAt as a stable tiebreak.
+    orderBy: [{ position: "asc" as const }, { createdAt: "asc" as const }],
+  };
+  return prisma.project.findMany({
+    where: { parentId: null },
+    orderBy: { name: "asc" },
+    include: {
+      tasks: tasksArg,
+      children: {
+        orderBy: { name: "asc" },
+        include: { tasks: tasksArg },
+      },
+    },
+  });
+}
+
+/** Flat list of every project, for the "add sub-project under…" picker. */
+export function getAllProjects() {
+  return prisma.project.findMany({ orderBy: { name: "asc" } });
+}
+
+export function getProjectById(id: string) {
+  return prisma.project.findUnique({ where: { id } });
+}
+
+/** The next position for a task appended to the end of a project (or no project). */
+export async function nextTaskPosition(projectId: string | null): Promise<number> {
+  const agg = await prisma.task.aggregate({
+    where: { projectId, deletedAt: null },
+    _max: { position: true },
+  });
+  return (agg._max.position ?? -1) + 1;
+}
+
+/**
+ * The day-view list: active tasks that are available right now (invariant 4).
+ * Unavailable tasks are ABSENT here, not returned-and-greyed — the caller shows
+ * exactly what comes back. For a sequence project, only its first unfinished
+ * task survives the filter; the later steps still exist and show when you open
+ * the project (getProjectTree), just not here.
+ */
+export async function getAvailableTasks() {
+  const today = await todayForUser();
+  const tasks = await prisma.task.findMany({
+    where: { deletedAt: null, status: "active" },
+    include: { project: true },
+    orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+  });
+
+  // First unfinished task per sequence project. The query is active-only and
+  // ordered by position, so the first task seen in a sequence project is its
+  // lowest-position unfinished step.
+  const firstStep = new Map<string, string>();
+  for (const t of tasks) {
+    if (t.projectId && t.project?.isSequence && !firstStep.has(t.projectId)) {
+      firstStep.set(t.projectId, t.id);
+    }
+  }
+
+  return tasks.filter((t) =>
+    isAvailable(
+      {
+        deferUntil: t.deferUntil,
+        project: t.project
+          ? { onHold: t.project.onHold, isSequence: t.project.isSequence }
+          : null,
+        isFirstUnfinishedInSequence:
+          t.projectId != null && t.project?.isSequence
+            ? firstStep.get(t.projectId) === t.id
+            : true,
+      },
+      today
+    )
+  );
+}
+
+/** Notes that stand alone (attached to no task), newest first. */
+export function getStandaloneNotes() {
+  return prisma.note.findMany({ where: { taskId: null }, orderBy: { createdAt: "desc" } });
+}
+
+/** Active tasks with their project and notes, for the management list. */
+export function getActiveTasksWithDetail() {
+  return prisma.task.findMany({
+    where: { deletedAt: null },
+    orderBy: { createdAt: "desc" },
+    include: { project: true, notes: { orderBy: { createdAt: "desc" } } },
+  });
+}
+
+/**
+ * The projects due for review today (decisions line 312), each with its open
+ * tasks. Never-reviewed projects come first, then the longest overdue. The
+ * review screen shows one at a time; this is the ordered queue it walks.
+ */
+export async function getProjectsDueForReview() {
+  const today = await todayForUser();
+  const projects = await prisma.project.findMany({
+    where: { reviewIntervalDays: { not: null } },
+    include: {
+      tasks: {
+        where: { deletedAt: null },
+        orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+      },
+    },
+  });
+  return projects
+    .filter((p) => isReviewDue(p, today))
+    .sort((a, b) => {
+      // Never-reviewed first (null sorts before any date), then oldest review.
+      const at = a.lastReviewedAt?.getTime() ?? -Infinity;
+      const bt = b.lastReviewedAt?.getTime() ?? -Infinity;
+      return at - bt;
+    });
 }
 
 // ---------------------------------------------------------------------------
