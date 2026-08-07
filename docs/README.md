@@ -29,3 +29,12 @@ Use the stack named in handoff.md and no other.
 When you are done, list WP1's acceptance criteria
 and tell me how you verified each one.
 ```
+
+Verify every package's acceptance criteria through the running app in the
+browser, not only through scripts and unit tests. Scripts and tests run in a
+single module graph, so they cannot catch a whole class of defect that only
+appears once the app is running — for example a server action and the
+server-component graph ending up with separate copies of a module-level
+singleton (this is how the write-guard defect fixed in `fix/write-guard-store`
+went unseen: `mutate()` verified green in scripts while a live server-action
+write could be wrongly blocked).
