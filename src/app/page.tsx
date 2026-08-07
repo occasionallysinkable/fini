@@ -58,6 +58,7 @@ export default async function Home() {
       <header className="flex items-baseline justify-between">
         <h1 className="text-lg font-semibold">fini</h1>
         <nav className="flex items-baseline gap-3 text-sm text-muted">
+          <Link href="/board" className="hover:text-text">board</Link>
           <Link href="/projects" className="hover:text-text">projects</Link>
           <Link href="/review" className="hover:text-text">review</Link>
           <form

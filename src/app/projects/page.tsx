@@ -146,6 +146,7 @@ export default async function ProjectsPage() {
         <h1 className="text-lg font-semibold">Projects</h1>
         <nav className="flex gap-3 text-sm text-muted">
           <Link href="/" className="hover:text-text">tasks</Link>
+          <Link href="/board" className="hover:text-text">board</Link>
           <Link href="/review" className="hover:text-text">review</Link>
         </nav>
       </header>
