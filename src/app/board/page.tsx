@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { auth } from "@/auth";
-import { getBoardData, getRecentActivity } from "@/lib/queries";
+import { getBoardData, getRecentActivity, getStaleData } from "@/lib/queries";
 import { Board } from "./Board";
 
 /*
@@ -30,7 +30,11 @@ export default async function BoardPage() {
     );
   }
 
-  const [data, activity] = await Promise.all([getBoardData(), getRecentActivity()]);
+  const [data, activity, stale] = await Promise.all([
+    getBoardData(),
+    getRecentActivity(),
+    getStaleData(),
+  ]);
 
   return (
     <main className="mx-auto max-w-5xl p-6">
@@ -49,12 +53,16 @@ export default async function BoardPage() {
         </nav>
       </header>
 
-      <Board data={data} activity={activity.map((a) => ({
-        id: a.id,
-        actor: a.actor,
-        summary: a.summary,
-        undoable: !!a.undoExpiresAt && a.undoExpiresAt.getTime() > Date.now(),
-      }))} />
+      <Board
+        data={data}
+        stale={stale}
+        activity={activity.map((a) => ({
+          id: a.id,
+          actor: a.actor,
+          summary: a.summary,
+          undoable: !!a.undoExpiresAt && a.undoExpiresAt.getTime() > Date.now(),
+        }))}
+      />
     </main>
   );
 }
