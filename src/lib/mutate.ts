@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import type { Activity, ActivityFilterKind } from "@prisma/client";
 import { prisma } from "./prisma";
 import { inWrite } from "./write-context";
+import { UNDO_VERB } from "./stale";
 
 /*
   The write spine (invariants 1 and 2).
@@ -172,7 +173,9 @@ export async function undo(activityId: string): Promise<Activity> {
     return tx.activity.create({
       data: {
         actor: "app",
-        verb: "undo",
+        // The reversal's verb is the one the staleness derivation excludes as a
+        // non-touch (@/lib/stale · isTouch). Shared constant so the two agree.
+        verb: UNDO_VERB,
         taskId: reversalTaskId,
         summary: `Undid: ${original.summary}`,
         filterKind: original.filterKind,

@@ -96,7 +96,7 @@ All of it goes in at WP1, including the columns nothing reads until stage 3. Add
 | Latest safe start | `due_at_utc − estimate_minutes`, where `due_at_utc` was built in the clock from invariant 11. Null when there is no estimate or no due date. Where there is a due date and no due time, the due instant is 00:00 on that date. |
 | The chain | Today's deadline-bearing tasks ordered by safe start. Read-only on every screen. |
 | `isAvailable(task)` | False when the defer date is in the future, the project is on hold, the project is a sequence and this is not its first unfinished task, or an unresolved blocker exists. Unavailable means absent from every day view, not greyed. |
-| Stale | No row in `activity` for this task in fourteen days, and `status = active`. Keeping writes an activity row, so the clock resets by the same rule everything else uses. |
+| Stale | No *touching* row in `activity` for this task in fourteen days, and `status = active`. Keeping writes an activity row, so the clock resets by the same rule everything else uses. An undo row (verb `undo`) is **not** a touch — it records that a write was reversed, not work on the task — and neither is the action it reversed (its `undo_expires_at` is nulled when undone). Both are excluded from the clock, so pressing undo on a keep or a push returns the task to the block rather than leaving it muted by its own reversal. |
 | Day total | The sum of that day's shifts. Displayed. Never used to refuse anything. |
 | Blocker lateness | `expected_by < today` flips the state to late. A nightly job does this; nothing moves any date. |
 

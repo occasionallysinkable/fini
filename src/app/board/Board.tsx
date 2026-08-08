@@ -31,12 +31,14 @@ import {
   type SortField,
   type ViewSnapshot,
 } from "@/lib/board";
-import type { BoardData, SavedViewRow } from "@/lib/queries";
+import type { BoardData, SavedViewRow, StaleData } from "@/lib/queries";
+import { staleView } from "@/lib/stale";
 import {
   bulkAction,
   quickAddTask,
   createSavedView,
   editTaskField,
+  setStaleTreatment,
   type BulkResult,
 } from "./actions";
 import { undoActivity } from "../actions";
@@ -62,8 +64,11 @@ import { undoActivity } from "../actions";
 */
 
 // The action bar's options, numbered 1..n in this order. Kill sits last because
-// it is the one that removes rows; the rest reshape them.
+// it is the one that removes rows; the rest reshape them. "keep" is not on the
+// bar — it is a stale-block action (WP5) — but it rides the same bulkAction path
+// so the block's writes undo like the bar's.
 type BulkKey = "kind" | "project" | "estimate" | "push" | "kill";
+type StaleKey = "keep" | "push" | "kill";
 const ACTION_ORDER: BulkKey[] = ["kind", "project", "estimate", "push", "kill"];
 
 const KIND_OPTIONS = ["commitment", "own", "habit", "unassigned"];
@@ -85,9 +90,11 @@ function todayLocal(): string {
 
 export function Board({
   data,
+  stale,
   activity,
 }: {
   data: BoardData;
+  stale: StaleData;
   activity: { id: string; actor: string; summary: string; undoable: boolean }[];
 }) {
   // ---- view state -------------------------------------------------------
@@ -96,6 +103,9 @@ export function Board({
   const [sort, setSort] = useState<Sort>(DEFAULT_SORT);
   const [wrap, setWrap] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+  // "Go through all" (a sweep) expands the stale block from three rows to every
+  // stale row. Reset whenever the server hands back a fresh stale set.
+  const [staleExpanded, setStaleExpanded] = useState(false);
 
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [focusIdx, setFocusIdx] = useState(-1);
@@ -122,6 +132,15 @@ export function Board({
   const undoFormRef = useRef<HTMLFormElement | null>(null);
 
   const today = useMemo(() => todayLocal(), []);
+  // The stale ids, as a set, for the "marked in place" treatment (a state word
+  // in the row) and to know which rows the block covers.
+  const staleSet = useMemo(() => new Set(stale.staleIds), [stale.staleIds]);
+  const markStaleInPlace = stale.treatment === "inPlace";
+  // Collapse the "go through all" expansion whenever the stale set changes (a
+  // keep/push/kill revalidated the board), so it never re-opens stale.
+  useEffect(() => {
+    setStaleExpanded(false);
+  }, [stale.staleIds]);
 
   // ---- derived view -----------------------------------------------------
   const visibleColumns = useMemo(
@@ -281,6 +300,21 @@ export function Board({
       setSelection(new Set());
     },
     [selection, runBulk]
+  );
+
+  // Stale-block actions ride the same bulkAction path as the selection bar, so
+  // their result and undo land on the same ledger line (invariant 8, R4) and the
+  // push count stays one number. keep/push/kill take the ids they act on: one
+  // task for a row's buttons, every stale id for a sweep.
+  const staleDispatch = useCallback(
+    (action: StaleKey, ids: string[]) => {
+      if (ids.length === 0) return;
+      const fd = new FormData();
+      fd.set("ids", JSON.stringify(ids));
+      fd.set("action", action);
+      startTransition(() => runBulk(fd));
+    },
+    [runBulk]
   );
 
   // Values the valued actions carry when triggered by their number key.
@@ -447,12 +481,15 @@ export function Board({
     }
   }
 
-  // State reads as words, never colour alone (invariant 7).
+  // State reads as words, never colour alone (invariant 7). Under the "marked in
+  // place" stale treatment, a stale task carries the word here instead of the
+  // block interrupting at the top (decisions line 87).
   function stateWords(task: BoardTask): string[] {
     const w: string[] = [];
     if (task.recurring) w.push("recurring");
     if (task.kind === "unassigned") w.push("kind not set");
     if (task.deferUntil && task.deferUntil > today) w.push("deferred");
+    if (markStaleInPlace && staleSet.has(task.id)) w.push("stale");
     return w;
   }
 
@@ -679,6 +716,104 @@ export function Board({
     });
   }
 
+  // ---- the stale block (WP5) --------------------------------------------
+  // A block at the top of the board, ruled in magenta, demanding a decision
+  // (decisions line 87). It is NOT a column and takes no part in grouping or
+  // sort — it is rendered here, outside the sheet grid, from the server's
+  // derived stale set, so it survives every column configuration including
+  // title-only (decisions line 95). Absent entirely when nothing is stale, with
+  // nothing in its place (decisions line 94).
+  function renderStaleBlock() {
+    if (stale.treatment !== "block" || stale.rows.length === 0) return null;
+    const { shown, remainderCount, remainderOldestAgeDays } = staleView(stale.rows, staleExpanded);
+    return (
+      <section className="mt-3 rounded border border-line border-l-4 border-l-deadline bg-surface/40 p-4">
+        <div className="text-sm">
+          <span className="font-medium text-deadline">Stale</span>{" "}
+          <span className="text-muted">
+            — nobody has touched {stale.totalCount === 1 ? "this" : "these"} in 14 days
+          </span>
+        </div>
+
+        <ul className="mt-3 flex flex-col divide-y divide-line">
+          {shown.map((r) => {
+            const meta = [r.keptLabel, `${r.ageDays}d`].filter(Boolean).join(" · ");
+            return (
+              <li key={r.id} className="flex items-center justify-between gap-3 py-2">
+                <span className="min-w-0">
+                  <span className={wrap ? "" : "block truncate"}>
+                    {r.title}
+                    {r.projectName && <span className="text-muted"> · {r.projectName}</span>}
+                  </span>
+                  <span className="text-xs text-muted">{meta}</span>
+                </span>
+                {/* Three actions each, and no more (decisions line 89). Each runs
+                    through mutate() and undoes (invariant 2). */}
+                <span className="flex shrink-0 items-center gap-3 text-sm">
+                  <button
+                    onClick={() => staleDispatch("keep", [r.id])}
+                    className="text-accent hover:underline"
+                  >
+                    keep
+                  </button>
+                  <button
+                    onClick={() => staleDispatch("push", [r.id])}
+                    className="text-accent hover:underline"
+                  >
+                    push
+                  </button>
+                  <button
+                    onClick={() => staleDispatch("kill", [r.id])}
+                    className="text-accent hover:underline"
+                  >
+                    kill
+                  </button>
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+
+        {/* Whatever is not shown is counted, and the oldest of it is named
+            (decisions line 88). */}
+        {remainderCount > 0 && (
+          <div className="mt-2 text-xs text-muted">
+            {remainderCount} more · oldest {remainderOldestAgeDays}d
+          </div>
+        )}
+
+        {/* Sweeps appear past a handful (decisions line 93, SWEEP_THRESHOLD).
+            "Go through all" expands to every stale row; "kill all" ends the pile
+            in one reversible write. */}
+        {stale.showSweeps && (
+          <div className="mt-3 flex flex-wrap items-center gap-4 text-sm">
+            {staleExpanded ? (
+              <button
+                onClick={() => setStaleExpanded(false)}
+                className="text-muted hover:text-text"
+              >
+                show three
+              </button>
+            ) : (
+              <button
+                onClick={() => setStaleExpanded(true)}
+                className="text-accent hover:underline"
+              >
+                go through all {stale.totalCount}
+              </button>
+            )}
+            <button
+              onClick={() => staleDispatch("kill", stale.staleIds)}
+              className="text-accent hover:underline"
+            >
+              kill all {stale.totalCount}
+            </button>
+          </div>
+        )}
+      </section>
+    );
+  }
+
   const totalHidden = hidden.left.length + hidden.right.length;
   const anyActive = data.active.length > 0;
   const displayedCount = filteredActive.length;
@@ -854,6 +989,25 @@ export function Board({
               <input type="checkbox" checked={wrap} onChange={() => setWrap((w) => !w)} />
               <span className="text-muted">wrap long titles</span>
             </label>
+            {/* The stale treatment — its home is here, never Settings (decisions
+                line 60). One control, three positions: the block at the top, the
+                quieter marked-in-place, or off (decisions lines 87, 96). It
+                persists through mutate() and undoes. */}
+            <label className="flex items-center gap-2">
+              <span className="text-muted">Stale work</span>
+              <form action={setStaleTreatment}>
+                <select
+                  name="value"
+                  defaultValue={stale.treatment}
+                  onChange={(e) => e.currentTarget.form?.requestSubmit()}
+                  className="rounded border border-line bg-surface px-2 py-1"
+                >
+                  <option value="block">a block at the top</option>
+                  <option value="inPlace">marked in place</option>
+                  <option value="off">off</option>
+                </select>
+              </form>
+            </label>
           </div>
         </div>
       )}
@@ -977,6 +1131,10 @@ export function Board({
         </div>
       ) : (
         <>
+          {/* The stale block sits at the top of the board, above the sheet. It is
+              not part of the sheet, so it holds through every column layout. */}
+          {renderStaleBlock()}
+
           {/* Hidden-count control (◂ N · M ▸), derived from what is scrolled out
               of view — not a count of switched-off columns. Clicking lists them. */}
           <div className="relative mt-3 flex items-center justify-between">

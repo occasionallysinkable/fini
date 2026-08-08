@@ -22,6 +22,7 @@ vi.mock("@/lib/queries", () => ({
   getTasksByIds: (ids: string[]) => getTasksByIdsMock(ids),
   getProjectById: (id: string) => getProjectByIdMock(id),
   getTask: vi.fn(),
+  getUserSettingsRow: vi.fn(),
   nextTaskPosition: vi.fn(),
   nextSavedViewPosition: vi.fn(),
 }));
@@ -118,6 +119,46 @@ describe("bulkAction · through mutate() with undo", () => {
     const tx = fakeTx();
     await input.apply(tx);
     expect(tx.task.update).toHaveBeenCalledWith({ where: { id: "t1" }, data: { pushCount: 5 } });
+  });
+
+  it("keep increments keepCount and reverses to the prior count (WP5)", async () => {
+    getTasksByIdsMock.mockResolvedValue([
+      { id: "t1", kind: "own", kindIsExplicit: false, projectId: null, estimateMinutes: null, pushCount: 0, keepCount: 1 },
+    ]);
+
+    const res = await bulkAction({}, form({ ids: JSON.stringify(["t1"]), action: "keep" }));
+
+    expect(res.summary).toBe("Kept 1 task");
+    const input = mutateMock.mock.calls[0][0] as {
+      verb: string;
+      undo: { ops: { data: Record<string, unknown> }[] };
+      apply: (tx: ReturnType<typeof fakeTx>) => Promise<unknown>;
+    };
+    // The keep-count verb is what queries.getStaleData counts as a kept row.
+    expect(input.verb).toBe("task.bulkKeep");
+    expect(input.undo.ops[0].data).toEqual({ keepCount: 1 });
+    const tx = fakeTx();
+    await input.apply(tx);
+    expect(tx.task.update).toHaveBeenCalledWith({ where: { id: "t1" }, data: { keepCount: 2 } });
+  });
+
+  it("stamps the activity taskId when exactly one task is acted on (resets its stale clock)", async () => {
+    getTasksByIdsMock.mockResolvedValue([
+      { id: "only", kind: "own", kindIsExplicit: false, projectId: null, estimateMinutes: null, pushCount: 0, keepCount: 0 },
+    ]);
+    await bulkAction({}, form({ ids: JSON.stringify(["only"]), action: "push" }));
+    const input = mutateMock.mock.calls[0][0] as { taskId: string | null };
+    expect(input.taskId).toBe("only");
+  });
+
+  it("leaves the activity taskId null when several tasks are acted on", async () => {
+    getTasksByIdsMock.mockResolvedValue([
+      { id: "t1", kind: "own", kindIsExplicit: false, projectId: null, estimateMinutes: null, pushCount: 0, keepCount: 0 },
+      { id: "t2", kind: "own", kindIsExplicit: false, projectId: null, estimateMinutes: null, pushCount: 0, keepCount: 0 },
+    ]);
+    await bulkAction({}, form({ ids: JSON.stringify(["t1", "t2"]), action: "kill" }));
+    const input = mutateMock.mock.calls[0][0] as { taskId: string | null };
+    expect(input.taskId).toBeNull();
   });
 
   it("refuses an empty selection and never writes", async () => {
