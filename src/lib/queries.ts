@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { todayInZone, weekdayOf, type ParseContext, type ShiftWindow } from "./parse";
 import { isAvailable } from "./availability";
 import { isReviewDue } from "./review";
+import { collectProjectSubtree } from "./projects";
 import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
 
 /*
@@ -55,12 +56,16 @@ export function getProjectTree() {
     // Sequence order is position, then createdAt as a stable tiebreak.
     orderBy: [{ position: "asc" as const }, { createdAt: "asc" as const }],
   };
+  // A deleted project (deleted_at set) is gone from the tree — the check lives
+  // here in the query, not in isAvailable(), because deletion must hide a
+  // project from every surface, not only the day views.
   return prisma.project.findMany({
-    where: { parentId: null },
+    where: { parentId: null, deletedAt: null },
     orderBy: { name: "asc" },
     include: {
       tasks: tasksArg,
       children: {
+        where: { deletedAt: null },
         orderBy: { name: "asc" },
         include: { tasks: tasksArg },
       },
@@ -68,13 +73,34 @@ export function getProjectTree() {
   });
 }
 
-/** Flat list of every project, for the "add sub-project under…" picker. */
+/** Flat list of every live project, for the "add sub-project under…" picker. */
 export function getAllProjects() {
-  return prisma.project.findMany({ orderBy: { name: "asc" } });
+  return prisma.project.findMany({ where: { deletedAt: null }, orderBy: { name: "asc" } });
 }
 
 export function getProjectById(id: string) {
   return prisma.project.findUnique({ where: { id } });
+}
+
+/**
+ * The live rows a project delete would take with it: the project, every
+ * sub-project beneath it (any depth), and every not-already-deleted task in any
+ * of them. Returned so the action can soft-delete the set in one write and build
+ * an undo that restores exactly this set — nothing that was already deleted.
+ */
+export async function getProjectDeletionSet(
+  rootId: string
+): Promise<{ projectIds: string[]; taskIds: string[] }> {
+  const liveProjects = await prisma.project.findMany({
+    where: { deletedAt: null },
+    select: { id: true, parentId: true },
+  });
+  const projectIds = collectProjectSubtree(liveProjects, rootId);
+  const tasks = await prisma.task.findMany({
+    where: { projectId: { in: projectIds }, deletedAt: null },
+    select: { id: true },
+  });
+  return { projectIds, taskIds: tasks.map((t) => t.id) };
 }
 
 /** The next position for a task appended to the end of a project (or no project). */
@@ -203,7 +229,11 @@ export async function getBoardData(): Promise<BoardData> {
       where: { deletedAt: null, status: { in: ["done", "cancelled"] } },
       ...withProject,
     }),
-    prisma.project.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+    prisma.project.findMany({
+      where: { deletedAt: null },
+      select: { id: true, name: true },
+      orderBy: { name: "asc" },
+    }),
     prisma.note.findMany({
       select: { id: true, body: true, taskId: true },
       orderBy: { createdAt: "desc" },
@@ -272,7 +302,7 @@ export function getActiveTasksWithDetail() {
 export async function getProjectsDueForReview() {
   const today = await todayForUser();
   const projects = await prisma.project.findMany({
-    where: { reviewIntervalDays: { not: null } },
+    where: { reviewIntervalDays: { not: null }, deletedAt: null },
     include: {
       tasks: {
         where: { deletedAt: null },
@@ -364,7 +394,7 @@ export async function resolveProjectPath(path: string[]): Promise<
   let parentId: string | null = null;
   for (const name of path) {
     const found: { id: string } | null = await prisma.project.findFirst({
-      where: { name: { equals: name, mode: "insensitive" }, parentId },
+      where: { name: { equals: name, mode: "insensitive" }, parentId, deletedAt: null },
       select: { id: true },
     });
     if (found) {
