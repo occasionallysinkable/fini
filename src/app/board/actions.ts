@@ -7,10 +7,12 @@ import {
   getTasksByIds,
   getProjectById,
   getTask,
+  getUserSettingsRow,
   nextTaskPosition,
   nextSavedViewPosition,
 } from "@/lib/queries";
 import type { Kind } from "@/lib/parse";
+import type { StaleTreatment } from "@/lib/stale";
 
 // The closed status set, kept local so app code does not import @prisma/client.
 type TaskStatus = "active" | "done" | "cancelled" | "someday";
@@ -171,6 +173,31 @@ export async function bulkAction(
       };
       break;
     }
+    case "keep": {
+      // WP5 · keeping a stale task. The mute is not this write — it is the
+      // activity row mutate() writes below, which resets the fourteen-day clock
+      // by the same rule that defines staleness (handoff line 99). The keepCount
+      // bump is the concrete, reversible change (so keep undoes like everything
+      // else) and the counter WP17's ranking reads; the block's kept count is
+      // counted from the log, not from here. KEEP_VERB tags the row so the count
+      // query finds it — kept in sync with the verb in @/lib/stale.
+      verb = "task.bulkKeep";
+      summary = `Kept ${n} ${plural(n)}`;
+      for (const t of tasks) {
+        undoOps.push({
+          action: "update",
+          model: "task",
+          id: t.id,
+          data: { keepCount: t.keepCount },
+        });
+      }
+      apply = async (tx) => {
+        for (const t of tasks) {
+          await tx.task.update({ where: { id: t.id }, data: { keepCount: t.keepCount + 1 } });
+        }
+      };
+      break;
+    }
     default:
       return { error: "Unknown action." };
   }
@@ -180,6 +207,13 @@ export async function bulkAction(
     verb,
     summary,
     filterKind,
+    // Stamp the activity row with the task when exactly one is acted on, so a
+    // single-task action (as the stale block always makes) genuinely touches
+    // that task — which is what resets its fourteen-day clock (decisions line 86:
+    // pushing counts as touching). A multi-task action cannot point at one task,
+    // so it stays null, exactly as before. This is why the stale block can reuse
+    // push and kill unchanged rather than fork a second write path.
+    taskId: tasks.length === 1 ? tasks[0].id : null,
     undo: { ops: undoOps },
     apply,
   });
@@ -358,6 +392,46 @@ export async function createSavedView(formData: FormData) {
           filter: (config.filter ?? []) as object,
         },
       }),
+  });
+
+  revalidatePath("/board");
+}
+
+/**
+ * WP5 · the stale treatment control. It lives in the board's config panel, not
+ * in Settings (decisions line 60), and has three positions (decisions lines 87,
+ * 96): the block at the top (default), marked in place (the quieter, no-interrupt
+ * alternative), or off. It persists in user.settings so an off switch stays off
+ * — a preference you had to re-set every visit would be its own kind of nagging.
+ * The write goes through mutate() like every other (invariant 1) and undoes back
+ * to the prior settings.
+ */
+const TREATMENTS = new Set<StaleTreatment>(["block", "inPlace", "off"]);
+const TREATMENT_WORDS: Record<StaleTreatment, string> = {
+  block: "a block at the top",
+  inPlace: "marked in place",
+  off: "off",
+};
+
+export async function setStaleTreatment(formData: FormData) {
+  await requireUser();
+  const value = String(formData.get("value") ?? "");
+  if (!TREATMENTS.has(value as StaleTreatment)) return;
+  const treatment = value as StaleTreatment;
+
+  const user = await getUserSettingsRow();
+  if (!user) return;
+  // settings is always an object once seeded; default to {} so undo never has to
+  // restore a Json null (which Prisma will not take through a plain undo op).
+  const prev = (user.settings ?? {}) as Record<string, unknown>;
+  const next = { ...prev, staleTreatment: treatment };
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "settings.staleTreatment",
+    summary: `Stale treatment: ${TREATMENT_WORDS[treatment]}`,
+    undo: { ops: [{ action: "update", model: "user", id: user.id, data: { settings: prev } }] },
+    apply: (tx) => tx.user.update({ where: { id: user.id }, data: { settings: next } }),
   });
 
   revalidatePath("/board");

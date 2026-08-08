@@ -4,6 +4,16 @@ import { isAvailable } from "./availability";
 import { isReviewDue } from "./review";
 import { collectProjectSubtree } from "./projects";
 import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
+import {
+  KEEP_VERB,
+  UNDO_VERB,
+  buildStaleRows,
+  isStale,
+  readStaleTreatment,
+  showSweeps,
+  type StaleRow,
+  type StaleTreatment,
+} from "./stale";
 
 /*
   The read layer. Components and routes call these instead of importing the
@@ -270,8 +280,110 @@ export function getTasksByIds(ids: string[]) {
       projectId: true,
       estimateMinutes: true,
       pushCount: true,
+      keepCount: true,
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// WP5 · the stale block. Staleness is derived here from the activity log, never
+// stored: a task is stale when no activity row has touched it in fourteen days
+// and its status is active (handoff line 99). The kept count is counted from the
+// same log — keep rows that have not been undone — rather than trusted to a
+// stored counter. Nothing about this reads a muted_until field, because there is
+// none: keeping writes an activity row and the same fourteen-day rule re-surfaces
+// the task, so the mute and the definition are one mechanism.
+// ---------------------------------------------------------------------------
+
+export interface StaleData {
+  treatment: StaleTreatment;
+  /** Every stale task, oldest first. The block shows three; sweeps show all. */
+  rows: StaleRow[];
+  totalCount: number;
+  showSweeps: boolean;
+  /** All stale task ids — for the in-place marks and for the sweep actions. */
+  staleIds: string[];
+}
+
+const EMPTY_STALE = (treatment: StaleTreatment): StaleData => ({
+  treatment,
+  rows: [],
+  totalCount: 0,
+  showSweeps: false,
+  staleIds: [],
+});
+
+/** The user's stored settings row (id + settings JSON), read for the board's
+ *  stale-treatment control. One user row (invariant 12's single life). */
+export function getUserSettingsRow() {
+  return prisma.user.findFirst({ select: { id: true, settings: true } });
+}
+
+export async function getStaleData(): Promise<StaleData> {
+  const user = await getUserSettingsRow();
+  const treatment = readStaleTreatment(user?.settings);
+  // Off means the whole mechanism is silent — no block, no marks, nothing
+  // computed (decisions line 96).
+  if (treatment === "off") return EMPTY_STALE(treatment);
+
+  const now = new Date();
+  const tasks = await prisma.task.findMany({
+    where: { deletedAt: null, status: "active" },
+    select: { id: true, title: true, createdAt: true, project: { select: { name: true } } },
+  });
+  if (tasks.length === 0) return EMPTY_STALE(treatment);
+
+  const ids = tasks.map((t) => t.id);
+  const [lastActivity, keeps] = await Promise.all([
+    // The most recent *touching* activity row per task — the fourteen-day clock
+    // reads this. The where clause mirrors isTouch() in @/lib/stale: an undo row
+    // is not a touch (it records a reversal), and neither is a row that was
+    // itself undone (undo() nulls its undoExpiresAt). Excluding both is what lets
+    // pressing undo on a keep or push return the task to the block, instead of
+    // its own reversal keeping it muted for fourteen days.
+    prisma.activity.groupBy({
+      by: ["taskId"],
+      where: { taskId: { in: ids }, verb: { not: UNDO_VERB }, undoExpiresAt: { not: null } },
+      _max: { at: true },
+    }),
+    // Keep rows not undone: a keep sets undoExpiresAt, and undo() nulls it, so
+    // "undoExpiresAt is not null" counts exactly the keeps still in effect. This
+    // is the kept count the block prints — counted from the log (handoff line 99).
+    prisma.activity.groupBy({
+      by: ["taskId"],
+      where: { taskId: { in: ids }, verb: KEEP_VERB, undoExpiresAt: { not: null } },
+      _count: { _all: true },
+    }),
+  ]);
+
+  const lastById = new Map<string, Date | null>();
+  for (const g of lastActivity) if (g.taskId) lastById.set(g.taskId, g._max.at);
+  const keepById = new Map<string, number>();
+  for (const g of keeps) if (g.taskId) keepById.set(g.taskId, g._count._all);
+
+  const staleInputs = tasks
+    .filter((t) =>
+      isStale(
+        { status: "active", lastActivityAt: lastById.get(t.id) ?? null, createdAt: t.createdAt },
+        now
+      )
+    )
+    .map((t) => ({
+      id: t.id,
+      title: t.title,
+      projectName: t.project?.name ?? null,
+      createdAt: t.createdAt,
+      keptCount: keepById.get(t.id) ?? 0,
+    }));
+
+  const rows = buildStaleRows(staleInputs, now);
+  return {
+    treatment,
+    rows,
+    totalCount: rows.length,
+    showSweeps: showSweeps(rows.length),
+    staleIds: rows.map((r) => r.id),
+  };
 }
 
 /** The next position for the saved-views strip (appended to the end). */
