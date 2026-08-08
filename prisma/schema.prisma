@@ -180,6 +180,12 @@ model Project {
   lastReviewedAt     DateTime?  @map("last_reviewed_at")
   hillState          HillState? @map("hill_state")
 
+  // Soft-delete (invariant 2): a deleted project sets deleted_at and nothing
+  // else, and undo clears it. Deleting a project cascades to its sub-projects
+  // and their tasks as one reversible set. Views exclude deleted_at IS NOT NULL
+  // in their queries — never in isAvailable(), which only governs live tasks.
+  deletedAt DateTime? @map("deleted_at")
+
   parent   Project?  @relation("ProjectTree", fields: [parentId], references: [id])
   children Project[] @relation("ProjectTree")
   tasks    Task[]

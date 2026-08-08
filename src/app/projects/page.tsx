@@ -7,6 +7,7 @@ import {
   toggleProjectHold,
   toggleProjectSequence,
   setReviewInterval,
+  deleteProject,
   addNote,
   undoActivity,
 } from "../actions";
@@ -107,6 +108,12 @@ function ProjectControls({ p, canNest }: { p: ProjectNode | ChildNode; canNest: 
           <button className="text-accent hover:underline">add</button>
         </form>
       )}
+      {/* Delete takes the project, its sub-projects and their tasks as one set.
+          No confirmation dialog — it undoes from the ledger below (invariant 2). */}
+      <form action={deleteProject}>
+        <input type="hidden" name="id" value={p.id} />
+        <button className="text-muted hover:text-deadline">delete</button>
+      </form>
     </div>
   );
 }
