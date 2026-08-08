@@ -6,6 +6,7 @@ import { mutate, undo, type UndoOp } from "@/lib/mutate";
 import {
   getTask,
   getProjectById,
+  getProjectDeletionSet,
   nextTaskPosition,
   buildCaptureContext,
   resolveProjectPath,
@@ -340,6 +341,69 @@ export async function markProjectReviewed(formData: FormData) {
 
   revalidatePath("/review");
   revalidatePath("/projects");
+}
+
+/**
+ * Delete a project, and everything in it, as one reversible set (invariant 2 —
+ * a delete sets deleted_at and nothing else; no confirmation dialog, because it
+ * undoes). The sub-projects beneath it and their live tasks go with it, and one
+ * undo restores the whole set. Deletion is enforced in the read queries, so the
+ * project then disappears from the tree, from board grouping and from review at
+ * once.
+ */
+export async function deleteProject(formData: FormData) {
+  await requireUser();
+  const id = String(formData.get("id"));
+  const project = await getProjectById(id);
+  if (!project || project.deletedAt) return;
+
+  const { projectIds, taskIds } = await getProjectDeletionSet(id);
+  const now = new Date();
+
+  // Undo restores exactly the rows this delete takes — the project, its
+  // sub-projects and their live tasks — back to not-deleted. Rows that were
+  // already deleted were never in the set, so undo never resurrects them.
+  const undoOps: UndoOp[] = [
+    ...projectIds.map((pid) => ({
+      action: "update" as const,
+      model: "project" as const,
+      id: pid,
+      data: { deletedAt: null },
+    })),
+    ...taskIds.map((tid) => ({
+      action: "update" as const,
+      model: "task" as const,
+      id: tid,
+      data: { deletedAt: null },
+    })),
+  ];
+
+  const subCount = projectIds.length - 1;
+  const parts: string[] = [];
+  if (subCount > 0) parts.push(`${subCount} sub-project${subCount === 1 ? "" : "s"}`);
+  if (taskIds.length > 0) parts.push(`${taskIds.length} task${taskIds.length === 1 ? "" : "s"}`);
+  const summary = parts.length
+    ? `Deleted “${project.name}” and everything in it — ${parts.join(", ")}`
+    : `Deleted “${project.name}”`;
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "project.delete",
+    filterKind: "deletions",
+    summary,
+    undo: { ops: undoOps },
+    apply: async (tx) => {
+      await tx.project.updateMany({ where: { id: { in: projectIds } }, data: { deletedAt: now } });
+      if (taskIds.length > 0) {
+        await tx.task.updateMany({ where: { id: { in: taskIds } }, data: { deletedAt: now } });
+      }
+    },
+  });
+
+  revalidatePath("/projects");
+  revalidatePath("/board");
+  revalidatePath("/review");
+  revalidatePath("/");
 }
 
 /** Add a note. Stands alone when no taskId is given, or attaches to a task. */
