@@ -70,6 +70,37 @@ export const COLUMNS: ColumnDef[] = [
 /** The four default columns (decisions line 58). */
 export const DEFAULT_COLUMNS: ColumnId[] = ["title", "project", "due", "estimate"];
 
+// ---------------------------------------------------------------------------
+// The state line — the words a screen prints in a task's title line.
+//
+// Invariant 7: state is words, never colour alone. Both the board (WP4) and the
+// task page (WP6, its state line) must print the SAME words in the SAME wording
+// — so this is the one place they are decided. A second copy would drift the
+// moment one screen adds a word the other does not (R6: the task page's state
+// line is "the same words the board prints, in the same wording").
+// ---------------------------------------------------------------------------
+
+export interface StateWordOpts {
+  /** Today as "YYYY-MM-DD" in the viewer's day — a defer date in the future reads
+   *  "deferred", one in the past does not. */
+  today: string;
+  /** Whether THIS task carries the board's "marked in place" stale word. It is a
+   *  board display treatment (decisions line 87), not a fact about the task, so
+   *  every other surface passes false. */
+  staleInPlace?: boolean;
+}
+
+/** The state words for one task, in their fixed order. Pure, so it unit-tests
+ *  and both the board and the task page call it rather than each re-deriving. */
+export function stateWords(task: BoardTask, opts: StateWordOpts): string[] {
+  const w: string[] = [];
+  if (task.recurring) w.push("recurring");
+  if (task.kind === "unassigned") w.push("kind not set");
+  if (task.deferUntil && task.deferUntil > opts.today) w.push("deferred");
+  if (opts.staleInPlace) w.push("stale");
+  return w;
+}
+
 /** What a task may be grouped by. Structured as a list so a second grouping is
  *  the same code path, not a special case (decisions line 60 lists both). */
 export type GroupKey = "project" | "kind" | "status";
