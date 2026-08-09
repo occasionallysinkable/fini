@@ -6,6 +6,7 @@ import {
   deriveHidden,
   filterCounts,
   searchEverything,
+  stateWords,
   captureSnapshot,
   applySnapshot,
   type BoardTask,
@@ -42,6 +43,38 @@ function task(over: Partial<BoardTask>): BoardTask {
 }
 
 const dueSort: Sort = { field: "due", dir: "asc" };
+
+// The state line — one shared function so the board and the task page cannot
+// drift (R6: the task page prints "the same words the board prints, in the same
+// wording"). WP6's task-page sidebar calls this very function, so guarding its
+// output here guards both surfaces at once.
+describe("stateWords · the shared state line", () => {
+  const today = "2026-08-08";
+
+  it("names recurring, kind-not-set and deferred, in that order", () => {
+    const t = task({ kind: "unassigned", recurring: true, deferUntil: "2026-09-01" });
+    expect(stateWords(t, { today })).toEqual(["recurring", "kind not set", "deferred"]);
+  });
+
+  it("says nothing for a plain task with a set kind", () => {
+    const t = task({ kind: "own" });
+    expect(stateWords(t, { today })).toEqual([]);
+  });
+
+  it("only calls a future defer date 'deferred'", () => {
+    expect(stateWords(task({ kind: "own", deferUntil: "2026-08-09" }), { today })).toEqual([
+      "deferred",
+    ]);
+    // A defer date in the past is spent — no word.
+    expect(stateWords(task({ kind: "own", deferUntil: "2026-08-01" }), { today })).toEqual([]);
+  });
+
+  it("adds the stale word only under the board's marked-in-place treatment", () => {
+    const t = task({ kind: "own" });
+    expect(stateWords(t, { today })).toEqual([]);
+    expect(stateWords(t, { today, staleInPlace: true })).toEqual(["stale"]);
+  });
+});
 
 describe("arrangeBoard · grouping and sort ordering", () => {
   it("sorts by due date soonest first, undated last", () => {

@@ -21,6 +21,7 @@ import {
   filterCounts,
   matchesChips,
   searchEverything,
+  stateWords,
   captureSnapshot,
   applySnapshot,
   type BoardGroup,
@@ -42,6 +43,7 @@ import {
   type BulkResult,
 } from "./actions";
 import { undoActivity } from "../actions";
+import { TaskSidebar } from "../task/TaskSidebar";
 
 /*
   WP4 · the interactive board. All the state a spreadsheet-like sheet needs lives
@@ -92,10 +94,13 @@ export function Board({
   data,
   stale,
   activity,
+  initialSidebarWidth,
 }: {
   data: BoardData;
   stale: StaleData;
   activity: { id: string; actor: string; summary: string; undoable: boolean }[];
+  /** The task-page sidebar's remembered width, read from user.settings (WP6). */
+  initialSidebarWidth: number;
 }) {
   // ---- view state -------------------------------------------------------
   const [grouping, setGrouping] = useState<GroupKey[]>(DEFAULT_GROUPING);
@@ -109,6 +114,13 @@ export function Board({
 
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [focusIdx, setFocusIdx] = useState(-1);
+
+  // WP6 · the task page opens as a sidebar over the board — the default of the
+  // three row-click routes (decisions line 75; the chooser and the other two
+  // routes are WP10). Row-click and Enter open it; it is otherwise a separate
+  // overlay, so the board's own state below is never disturbed by it.
+  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+  const openTask = useCallback((id: string) => setOpenTaskId(id), []);
 
   const [searching, setSearching] = useState(false);
   const [query, setQuery] = useState("");
@@ -349,6 +361,10 @@ export function Board({
   // ---- keyboard ---------------------------------------------------------
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      // While the task-page sidebar is open it owns the keyboard (its own Escape
+      // closes it). The board's shortcuts stand down so the two never fight.
+      if (openTaskId) return;
+
       const el = e.target as HTMLElement | null;
       const typing =
         el instanceof HTMLInputElement ||
@@ -403,6 +419,15 @@ export function Board({
         }
         return;
       }
+      // Enter opens the focused row's task page (invariant 9 — the open gesture
+      // has a key, not only a click).
+      if (e.key === "Enter") {
+        if (focusIdx >= 0 && flatIds[focusIdx]) {
+          e.preventDefault();
+          openTask(flatIds[focusIdx]);
+        }
+        return;
+      }
       if (selection.size && /^[1-5]$/.test(e.key)) {
         const act = ACTION_ORDER[Number(e.key) - 1];
         if (act) {
@@ -421,6 +446,8 @@ export function Board({
     selection,
     focusIdx,
     flatIds,
+    openTaskId,
+    openTask,
     enterSearch,
     exitSearchRestore,
     convertToChip,
@@ -481,16 +508,15 @@ export function Board({
     }
   }
 
-  // State reads as words, never colour alone (invariant 7). Under the "marked in
-  // place" stale treatment, a stale task carries the word here instead of the
-  // block interrupting at the top (decisions line 87).
-  function stateWords(task: BoardTask): string[] {
-    const w: string[] = [];
-    if (task.recurring) w.push("recurring");
-    if (task.kind === "unassigned") w.push("kind not set");
-    if (task.deferUntil && task.deferUntil > today) w.push("deferred");
-    if (markStaleInPlace && staleSet.has(task.id)) w.push("stale");
-    return w;
+  // State reads as words, never colour alone (invariant 7). The wording lives in
+  // one shared function so the board and the task page's state line cannot drift
+  // (R6: "the same words the board prints"). The "marked in place" stale word is
+  // the board's own display treatment (decisions line 87), passed in per task.
+  function wordsFor(task: BoardTask): string[] {
+    return stateWords(task, {
+      today,
+      staleInPlace: markStaleInPlace && staleSet.has(task.id),
+    });
   }
 
   const perGroupAdd = grouping.length === 1 && grouping[0] === "project";
@@ -609,8 +635,7 @@ export function Board({
   function renderRow(task: BoardTask) {
     const selected = selection.has(task.id);
     const focused = focusIdx >= 0 && flatIds[focusIdx] === task.id;
-    const words = stateWords(task);
-    const titleSpec: EditSpec = { field: "title", editKind: "text", raw: (t) => t.title };
+    const words = wordsFor(task);
     return (
       <div key={task.id} className="contents">
         <div
@@ -625,17 +650,19 @@ export function Board({
             aria-label={`select ${task.title}`}
             className="mt-1"
           />
+          {/* The title opens the task page (WP6 · the row-click default is the
+              sidebar). The title is edited in place ON the task page (R6: every
+              value edits in place there); the other columns still edit in place
+              on the board. */}
           <span className="min-w-0 flex-1">
-            <EditableCell
-              taskId={task.id}
-              spec={titleSpec}
-              editing={editingCell?.id === task.id && editingCell.field === "title"}
-              onOpen={() => setEditingCell({ id: task.id, field: "title" })}
-              onClose={() => setEditingCell(null)}
+            <button
+              type="button"
+              onClick={() => openTask(task.id)}
+              className={`w-full text-left hover:text-accent ${wrap ? "" : "truncate"}`}
             >
               {task.title}
               {words.length > 0 && <span className="text-muted"> · {words.join(" · ")}</span>}
-            </EditableCell>
+            </button>
           </span>
         </div>
         {nonTitle.map((col) => {
@@ -1289,6 +1316,15 @@ export function Board({
           ))}
         </ul>
       </section>
+
+      {/* The task page, over the board. A separate overlay: opening or closing it
+          touches none of the board state above (no snapshot needed — unlike the
+          search takeover, it never flattens the view it sits over). */}
+      <TaskSidebar
+        taskId={openTaskId}
+        initialWidth={initialSidebarWidth}
+        onClose={() => setOpenTaskId(null)}
+      />
     </div>
   );
 }
