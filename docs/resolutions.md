@@ -66,6 +66,8 @@ A field that is empty is not drawn as an empty field. Each section ends in one p
 
 The page opens in a sidebar over whatever you were looking at, dragged wide or narrow, and its width is remembered. The other two routes from the board — expand in place, open in a tab — stay as settings.
 
+Opening it is now the board's title-column click. WP4 left a row-click doing nothing because this page did not exist yet; now that it does, clicking a task's title opens it here. One consequence, recorded so it is not a surprise: the board's title column no longer edits in place. Renaming lives in one place — this page, where every value edits in place — rather than two, and the title is the row's identity, so clicking it to open the task reads more naturally than clicking it to rename. The board's other columns still edit in place; only the title's click changed.
+
 ### R7 · People: grouped pairs, not slots
 
 Store person-and-role pairs. Draw only the roles that have someone in them, each role a small heading with its people under it. A task with nobody attached shows no roles at all, only the words *add a person*.
@@ -251,7 +253,7 @@ A chain block prints the word *deadline* under its title whenever the block is t
 | Resolution | Rule it replaces | Now |
 | --- | --- | --- |
 | R4 | Undo held "for a few seconds" | One ledger line, held until the next answer replaces it. |
-| R6 | Clicking a board row does nothing by default | Still true for the board. The task page itself now has a decided shape and opens as a sidebar when it is opened. |
+| R6 | Clicking a board row does nothing by default | The task page has a decided shape and opens as a sidebar. Clicking a task's title on the board opens it; the board's title column no longer edits in place, because renaming now lives on the task page. The board's other columns still edit in place. |
 | R13 | "The setup screen for shifts" as a thing to draw | There is no such screen. One onboarding question, then a Settings table. |
 | R16 | Quick-add syntax "not yet chosen" | Chosen, in full, including that a bare date is a do date. |
 | R17 | Kind as a field you set | Inferred from people and recurrence, printed, overridable. |

@@ -4,6 +4,7 @@ import { isAvailable } from "./availability";
 import { isReviewDue } from "./review";
 import { collectProjectSubtree } from "./projects";
 import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
+import { fmtMinutes, type TaskPageData } from "./task-page";
 import {
   KEEP_VERB,
   UNDO_VERB,
@@ -264,6 +265,78 @@ export async function getBoardData(): Promise<BoardData> {
       sort: (v.sort as unknown as Sort) ?? { field: "due", dir: "asc" },
       filter: (v.filter as string[]) ?? [],
     })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// WP6 · the task page. One task read whole for the sidebar: the five sections'
+// fields, the person-and-role pairs, the notes, the reminders (WP7 lists them;
+// their add flow and the estimate-derived line are WP7's), and the task's own
+// activity history — the rows WP1's write spine has been writing all along, read
+// here collapsed with a count. Shaped into TaskPageData (strings, not Date
+// objects) so the client sidebar receives a plain, serialisable payload.
+// ---------------------------------------------------------------------------
+
+/** A plain label for a reminder in the WP6 shell. WP7 computes real times and the
+ *  "computed from the estimate" line; here it is enough to name it. */
+function reminderLabel(offsetMinutes: number | null): string {
+  if (offsetMinutes == null) return "At the due time";
+  return `${fmtMinutes(offsetMinutes)} before`;
+}
+
+export async function getTaskPageData(id: string): Promise<TaskPageData | null> {
+  const t = await prisma.task.findFirst({
+    where: { id, deletedAt: null },
+    include: {
+      project: { select: { name: true } },
+      taskPeople: {
+        include: { person: { select: { id: true, name: true, timezone: true } } },
+      },
+      notes: { orderBy: { createdAt: "desc" } },
+      reminders: { orderBy: { createdAt: "asc" } },
+    },
+  });
+  if (!t) return null;
+
+  // History is last and collapsed (R6): the most recent entries plus a total
+  // count. It reads the activity log, adding no store of its own.
+  const [history, historyCount] = await Promise.all([
+    prisma.activity.findMany({ where: { taskId: id }, orderBy: { at: "desc" }, take: 20 }),
+    prisma.activity.count({ where: { taskId: id } }),
+  ]);
+
+  return {
+    id: t.id,
+    title: t.title,
+    boardTask: toBoardTask(t),
+    dueDate: ymd(t.dueDate),
+    dueTime: t.dueTime,
+    doDate: ymd(t.doDate),
+    deferUntil: ymd(t.deferUntil),
+    estimateMinutes: t.estimateMinutes,
+    splittable: t.splittable,
+    minChunkMinutes: t.minChunkMinutes,
+    actualMinutes: t.actualMinutes,
+    people: t.taskPeople.map((tp) => ({
+      personId: tp.person.id,
+      name: tp.person.name,
+      timezone: tp.person.timezone,
+      role: tp.role,
+    })),
+    reminders: t.reminders.map((r) => ({
+      id: r.id,
+      label: r.isStartReminder ? "Start reminder" : reminderLabel(r.offsetMinutes),
+      when: null,
+      isStart: r.isStartReminder,
+    })),
+    notes: t.notes.map((n) => ({ id: n.id, body: n.body })),
+    history: history.map((a) => ({
+      id: a.id,
+      at: a.at.toISOString(),
+      actor: a.actor,
+      summary: a.summary,
+    })),
+    historyCount,
   };
 }
 
