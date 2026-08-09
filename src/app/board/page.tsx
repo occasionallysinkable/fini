@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { auth } from "@/auth";
-import { getBoardData, getRecentActivity, getStaleData } from "@/lib/queries";
+import { getBoardData, getRecentActivity, getStaleData, getUserSettingsRow } from "@/lib/queries";
+import { readSidebarWidth } from "@/lib/task-page";
 import { Board } from "./Board";
 
 /*
@@ -30,11 +31,15 @@ export default async function BoardPage() {
     );
   }
 
-  const [data, activity, stale] = await Promise.all([
+  const [data, activity, stale, userSettings] = await Promise.all([
     getBoardData(),
     getRecentActivity(),
     getStaleData(),
+    getUserSettingsRow(),
   ]);
+  // The task-page sidebar's remembered width lives in user.settings (WP6 writes
+  // it there; WP10 reads the same key). Defaults when never dragged.
+  const sidebarWidth = readSidebarWidth(userSettings?.settings);
 
   return (
     <main className="mx-auto max-w-5xl p-6">
@@ -56,6 +61,7 @@ export default async function BoardPage() {
       <Board
         data={data}
         stale={stale}
+        initialSidebarWidth={sidebarWidth}
         activity={activity.map((a) => ({
           id: a.id,
           actor: a.actor,
