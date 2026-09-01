@@ -3,9 +3,22 @@
 import { revalidatePath } from "next/cache";
 import { auth } from "@/auth";
 import { mutate, type UndoOp } from "@/lib/mutate";
-import { getTask, getTaskPageData, getUserSettingsRow, resolvePerson } from "@/lib/queries";
+import {
+  getTask,
+  getTaskPageData,
+  getUserSettingsRow,
+  getReminder,
+  getEnabledReminders,
+  resolvePerson,
+} from "@/lib/queries";
 import { clampSidebarWidth, SIDEBAR_WIDTH_KEY, type TaskPageData } from "@/lib/task-page";
 import type { Role } from "@/lib/parse";
+import { computeFireTime, wallToUtc, reminderLabel, PRESETS } from "@/lib/reminders";
+import {
+  getReminderSettings,
+  reminderRescheduleOps,
+  type ReschedulableReminder,
+} from "@/lib/reminder-service";
 
 /*
   WP6 · the task page's writes. Every one goes through mutate() (invariant 1)
@@ -145,17 +158,53 @@ export async function editTaskPageField(input: {
       return getTaskPageData(id);
   }
 
+  // Moving the due date or time reschedules every offset reminder on the task in
+  // the same write, so the change and the reschedule reverse together
+  // (reminders.md: "Every offset reminder moves with it"). Absolute reminders are
+  // left where they are.
+  const reminderApply: UndoOp[] = [];
+  const reminderUndo: UndoOp[] = [];
+  if (field === "dueDate" || field === "dueTime") {
+    const [reminders, settings] = await Promise.all([getEnabledReminders(id), getReminderSettings()]);
+    if (reminders.length > 0) {
+      const newDue =
+        field === "dueDate"
+          ? { dueDate: value.trim() || null, dueTime: before.dueTime }
+          : { dueDate: dateToIso(before.dueDate), dueTime: value.trim() || null };
+      const ops = reminderRescheduleOps(
+        reminders as ReschedulableReminder[],
+        newDue,
+        settings.timeZone
+      );
+      reminderApply.push(...ops.apply);
+      reminderUndo.push(...ops.undo);
+    }
+  }
+
   await mutate({
     actor: { kind: "user" },
     verb: `task.page.${field}`,
     taskId: id,
     summary,
     filterKind,
-    undo: { ops: [{ action: "update", model: "task", id, data: undoData }] },
-    apply: (tx) => tx.task.update({ where: { id }, data }),
+    undo: { ops: [{ action: "update", model: "task", id, data: undoData }, ...reminderUndo] },
+    apply: async (tx) => {
+      const updated = await tx.task.update({ where: { id }, data });
+      for (const op of reminderApply) {
+        if (op.action === "update") {
+          await tx.reminder.update({ where: { id: op.id }, data: op.data });
+        }
+      }
+      return updated;
+    },
   });
 
   return reloadAndRevalidate(id);
+}
+
+/** A stored date column (midnight-UTC) back to "YYYY-MM-DD". */
+function dateToIso(d: Date | null): string | null {
+  return d ? d.toISOString().slice(0, 10) : null;
 }
 
 const ROLES = new Set<Role>(["asked_by", "waiting_on", "delegated_to", "assignee"]);
@@ -258,4 +307,91 @@ export async function setSidebarWidth(width: number): Promise<void> {
   });
 
   revalidatePath("/board");
+}
+
+// ---------------------------------------------------------------------------
+// WP7 · reminders on the task page. A preset is an offset from the due time (so
+// moving the deadline moves it); a custom reminder is an absolute date and time
+// that stays put. Both compute their fire instant in the user's zone. Removing a
+// reminder disables it rather than destroying the row (invariant 2), so it
+// reverses like every other write.
+// ---------------------------------------------------------------------------
+
+export async function addReminder(input: {
+  id: string;
+  presetId?: string;
+  absoluteDate?: string;
+  absoluteTime?: string;
+}): Promise<TaskPageData | null> {
+  await requireUser();
+  const task = await getTask(input.id);
+  if (!task || task.deletedAt) return null;
+  const settings = await getReminderSettings();
+
+  const reminderId = crypto.randomUUID();
+  let data: { offsetMinutes: number | null; absoluteAt: Date | null; nextFireAtUtc: Date | null };
+
+  if (input.presetId) {
+    const preset = PRESETS.find((p) => p.id === input.presetId);
+    if (!preset) return getTaskPageData(input.id);
+    // A preset needs a due date to offset from; the UI does not offer it without
+    // one, and this guards the action path too.
+    if (!task.dueDate) return getTaskPageData(input.id);
+    const nextFireAtUtc = computeFireTime({
+      dueDate: dateToIso(task.dueDate),
+      dueTime: task.dueTime,
+      timeZone: settings.timeZone,
+      offsetMinutes: preset.offsetMinutes,
+    });
+    data = { offsetMinutes: preset.offsetMinutes, absoluteAt: null, nextFireAtUtc };
+  } else if (input.absoluteDate && input.absoluteTime) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(input.absoluteDate) || !/^\d{2}:\d{2}$/.test(input.absoluteTime)) {
+      return getTaskPageData(input.id);
+    }
+    const absoluteAt = wallToUtc(input.absoluteDate, input.absoluteTime, settings.timeZone);
+    data = { offsetMinutes: null, absoluteAt, nextFireAtUtc: absoluteAt };
+  } else {
+    return getTaskPageData(input.id);
+  }
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "reminder.add",
+    taskId: input.id,
+    filterKind: "reminders",
+    summary: `Added a reminder (${reminderLabel({ offsetMinutes: data.offsetMinutes, absoluteAt: data.absoluteAt })}) on “${task.title}”`,
+    undo: { ops: [{ action: "deleteRow", model: "reminder", id: reminderId }] },
+    apply: (tx) => tx.reminder.create({ data: { id: reminderId, taskId: input.id, ...data } }),
+  });
+
+  return reloadAndRevalidate(input.id);
+}
+
+export async function removeReminder(input: { id: string; reminderId: string }): Promise<TaskPageData | null> {
+  await requireUser();
+  const reminder = await getReminder(input.reminderId);
+  if (!reminder || reminder.taskId !== input.id || !reminder.enabled) return getTaskPageData(input.id);
+  const task = await getTask(input.id);
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "reminder.remove",
+    taskId: input.id,
+    filterKind: "reminders",
+    summary: `Removed a reminder on “${task?.title ?? "a task"}”`,
+    undo: {
+      ops: [
+        {
+          action: "update",
+          model: "reminder",
+          id: input.reminderId,
+          data: { enabled: reminder.enabled, nextFireAtUtc: reminder.nextFireAtUtc },
+        },
+      ],
+    },
+    apply: (tx) =>
+      tx.reminder.update({ where: { id: input.reminderId }, data: { enabled: false, nextFireAtUtc: null } }),
+  });
+
+  return reloadAndRevalidate(input.id);
 }

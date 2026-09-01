@@ -30,11 +30,24 @@ function ensureConfigured(): void {
   configured = true;
 }
 
-export interface PushPayload {
-  title: string;
-  body: string;
-  tag?: string;
-}
+/*
+  The two shapes a push carries. A "reminder" is shown as a notification; a
+  "close" carries no visible notification — it tells every device's service
+  worker to withdraw the notifications for the named tags (multi-device
+  withdrawal). The service worker branches on `type`.
+*/
+export type PushPayload =
+  | {
+      type: "reminder";
+      title: string;
+      body: string;
+      tag: string;
+      reminderId: string;
+      /** How many times this reminder has already been snoozed, so the worker
+       *  knows whether Later expands into reasons or into longer intervals. */
+      snoozeCount: number;
+    }
+  | { type: "close"; tags: string[] };
 
 export interface WebPushSubscription {
   endpoint: string;

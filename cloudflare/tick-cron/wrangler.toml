@@ -1,0 +1,16 @@
+name = "fini-tick-cron"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Every minute. Reminders are accurate to the minute (handoff).
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+# The app's origin. Change to your deployed URL before `wrangler deploy`.
+APP_URL = "https://REPLACE-WITH-YOUR-APP.vercel.app"
+
+# CRON_SECRET is NOT set here — it is a Worker secret, so it never lands in the
+# repo. Set it after deploy with:
+#   wrangler secret put CRON_SECRET
+# and paste the SAME value you set as CRON_SECRET in the app's Vercel env.

@@ -13,6 +13,7 @@ import {
   resolvePerson,
 } from "@/lib/queries";
 import { parse, inferKind, todayInZone, weekdayOf, type Role, type Kind } from "@/lib/parse";
+import { getReminderSettings, planReminders, reminderCreateOps } from "@/lib/reminder-service";
 
 async function requireUser() {
   const session = await auth();
@@ -96,9 +97,25 @@ export async function captureTask(
   // A new task lands at the end of its project's order (WP3 position).
   const position = await nextTaskPosition(leafProjectId);
 
-  // Reversal, in FK-safe order: links, then task, then anything this capture
-  // newly created (people, then projects leaf→root).
+  // WP7 · reminders you set. The parser already read the '+' tokens (R16); here
+  // they become real Reminder rows with their fire instants computed in the
+  // user's zone. The default-reminder toggle adds one when it is on and the user
+  // named none — nothing arms itself otherwise (reminders are opt in).
+  const reminderSettings = await getReminderSettings();
+  const plannedReminders = planReminders({
+    dueDate: p.dueDate,
+    dueTime: p.dueTime,
+    fallbackDate: ctx.today,
+    timeZone: reminderSettings.timeZone,
+    typed: p.reminders.map((r) => ({ offsetMinutes: r.offsetMinutes, absoluteTime: r.absoluteTime })),
+    defaultReminder: reminderSettings.defaultReminder,
+  });
+  const reminderOps = reminderCreateOps(taskId, plannedReminders);
+
+  // Reversal, in FK-safe order: reminders and links, then task, then anything
+  // this capture newly created (people, then projects leaf→root).
   const undoOps: UndoOp[] = [
+    ...reminderOps.undo,
     { action: "deleteWhere", model: "taskPerson", where: { taskId } },
     { action: "deleteRow", model: "task", id: taskId },
   ];
@@ -152,6 +169,9 @@ export async function captureTask(
         await tx.taskPerson.create({
           data: { taskId, personId: person.id, role: person.role },
         });
+      }
+      for (const r of reminderOps.creates) {
+        await tx.reminder.create({ data: r });
       }
       return task;
     },

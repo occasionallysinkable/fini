@@ -80,26 +80,25 @@ describe("the five sections", () => {
   it("on an empty task, every section is unpopulated and offers just its control", () => {
     const sections = buildSections(tp());
     expect(sections.every((s) => !s.populated)).toBe(true);
-    // Every section but reminders offers its add word; reminders has no control
-    // in WP6 (WP7 adds the flow), so it is null and, being empty, absent entirely.
+    // WP7 gives reminders its own add flow, so every section now offers its word.
     expect(sections.map((s) => s.control)).toEqual([
       "add a date",
       "add an estimate",
       "add a person",
-      null,
+      "add a reminder",
       "add a note",
     ]);
   });
 
-  it("gives the reminders section no control in WP6, and lists them when present", () => {
+  it("gives the reminders section its control and lists them when present (WP7)", () => {
     const empty = buildSections(tp()).find((s) => s.id === "reminders")!;
-    expect(empty.control).toBeNull();
-    expect(empty.populated).toBe(false); // null control + empty ⇒ drawn as nothing
+    expect(empty.control).toBe("add a reminder");
+    expect(empty.populated).toBe(false); // empty ⇒ heading hidden, control shown
     const withOne = buildSections(
       tp({ reminders: [{ id: "r", label: "A day before", when: null, isStart: false }] })
     ).find((s) => s.id === "reminders")!;
-    expect(withOne.populated).toBe(true); // present ⇒ listed read-only
-    expect(withOne.control).toBeNull(); // still no add control until WP7
+    expect(withOne.populated).toBe(true); // present ⇒ listed with its heading
+    expect(withOne.control).toBe("add a reminder");
   });
 
   it("marks a section populated only when it has content", () => {
