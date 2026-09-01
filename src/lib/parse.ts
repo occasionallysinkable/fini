@@ -71,9 +71,22 @@ export interface ParsedReminder {
   absoluteTime?: string; // "HH:MM" for +9am style
 }
 
+export type ParsedRecurrencePattern =
+  | "daily"
+  | "weekdays"
+  | "weekly"
+  | "monthly_date"
+  | "every_n_weeks";
+
 export interface ParsedRecurrence {
   mode: "fixed" | "after_completion";
   description: string;
+  /** The structured fields WP8 persists as a recurrence_rule. `weekdays` is
+   *  length 7 (index 0 = Sunday) and meaningful only for the weekly pattern. */
+  pattern: ParsedRecurrencePattern;
+  weekdays: boolean[];
+  dayOfMonth: number | null;
+  n: number | null;
 }
 
 export interface EchoLine {
@@ -456,41 +469,123 @@ export function parse(raw: string, ctx: ParseContext): ParseResult {
   }
 
   // 3. Recurrence — 'every' / 'every!' before dates, so "every 1st" is not a date.
+  // Each spec's build returns the structured rule (WP8's five patterns) plus its
+  // prose, or null when the typed interval is not one of the five — e.g. "every
+  // 3d". A null result is NOT consumed, so the words stay in the title
+  // (invariant 13: nothing parsed is discarded) rather than vanishing into a rule
+  // the schema cannot hold.
+  type BuiltRule = {
+    description: string;
+    pattern: ParsedRecurrencePattern;
+    weekdays: boolean[];
+    dayOfMonth: number | null;
+    n: number | null;
+  };
+  const noWeekdays = () => [false, false, false, false, false, false, false];
   let recurrence: ParsedRecurrence | null = null;
   const recurrence_specs: {
     re: RegExp;
-    build: (m: RegExpMatchArray) => string;
+    build: (m: RegExpMatchArray) => BuiltRule | null;
   }[] = [
     {
+      // every 1st  →  monthly on that date
       re: new RegExp(`\\bevery(!?)\\s+(\\d{1,2})(?:st|nd|rd|th)\\b`, "i"),
-      build: (m) => `on the ${m[2]}${ordinal(Number(m[2]))} of each month`,
+      build: (m) => ({
+        description: `on the ${m[2]}${ordinal(Number(m[2]))} of each month`,
+        pattern: "monthly_date",
+        weekdays: noWeekdays(),
+        dayOfMonth: Number(m[2]),
+        n: null,
+      }),
     },
     {
+      // every 7d / every!7d  →  a day interval, mapped onto the five patterns:
+      // 1 day is daily; a multiple of seven is every-N-weeks (so 7d = every week,
+      // the plants example); any other count is not one of the five, so it is
+      // left in the title.
       re: new RegExp(`\\bevery(!?)\\s*(\\d+)\\s*d(?:ays?)?\\b`, "i"),
-      build: (m) => `every ${m[2]} days`,
+      build: (m) => {
+        const days = Number(m[2]);
+        if (days === 1) {
+          return { description: "every day", pattern: "daily", weekdays: noWeekdays(), dayOfMonth: null, n: null };
+        }
+        if (days % 7 === 0) {
+          const n = days / 7;
+          return {
+            description: n === 1 ? "every week" : `every ${n} weeks`,
+            pattern: "every_n_weeks",
+            weekdays: noWeekdays(),
+            dayOfMonth: null,
+            n,
+          };
+        }
+        return null; // not one of the five patterns — stays in the title
+      },
     },
     {
+      // every 2 weeks
       re: new RegExp(`\\bevery(!?)\\s+(\\d+)\\s+weeks?\\b`, "i"),
-      build: (m) => `every ${m[2]} weeks`,
+      build: (m) => {
+        const n = Number(m[2]);
+        return {
+          description: n === 1 ? "every week" : `every ${n} weeks`,
+          pattern: "every_n_weeks",
+          weekdays: noWeekdays(),
+          dayOfMonth: null,
+          n,
+        };
+      },
     },
     {
+      // every Monday  →  weekly on that weekday
       re: new RegExp(`\\bevery(!?)\\s+(${WEEKDAYS})\\b`, "i"),
-      build: (m) => `every ${cap(fullWeekday(m[2]))}`,
+      build: (m) => {
+        const idx = WEEKDAY_INDEX[m[2].slice(0, 3).toLowerCase()];
+        const weekdays = noWeekdays();
+        if (idx != null) weekdays[idx] = true;
+        return {
+          description: `every ${cap(fullWeekday(m[2]))}`,
+          pattern: "weekly",
+          weekdays,
+          dayOfMonth: null,
+          n: null,
+        };
+      },
     },
     {
+      // every day / every weekday(s) / every week
       re: new RegExp(`\\bevery(!?)\\s+(weekdays?|day|week)\\b`, "i"),
-      build: (m) => `every ${m[2].toLowerCase()}`,
+      build: (m) => {
+        const word = m[2].toLowerCase();
+        const pattern: ParsedRecurrencePattern =
+          word === "day" ? "daily" : word === "week" ? "weekly" : "weekdays";
+        return {
+          description: `every ${word}`,
+          pattern,
+          weekdays: noWeekdays(),
+          dayOfMonth: null,
+          n: null,
+        };
+      },
     },
   ];
   for (const spec of recurrence_specs) {
     const m = s.match(spec.re);
-    if (m) {
-      const mode = m[1] === "!" ? "after_completion" : "fixed";
-      const suffix = mode === "after_completion" ? " from completion" : "";
-      recurrence = { mode, description: spec.build(m) + suffix };
-      remove(m[0], m.index!);
-      break;
-    }
+    if (!m) continue;
+    const built = spec.build(m);
+    if (!built) continue; // not representable — leave the words in the title
+    const mode = m[1] === "!" ? "after_completion" : "fixed";
+    const suffix = mode === "after_completion" ? " from completion" : "";
+    recurrence = {
+      mode,
+      description: built.description + suffix,
+      pattern: built.pattern,
+      weekdays: built.weekdays,
+      dayOfMonth: built.dayOfMonth,
+      n: built.n,
+    };
+    remove(m[0], m.index!);
+    break;
   }
 
   // 4. Defer until — '^' then a date.

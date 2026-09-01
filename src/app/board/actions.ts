@@ -13,6 +13,7 @@ import {
 } from "@/lib/queries";
 import type { Kind } from "@/lib/parse";
 import type { StaleTreatment } from "@/lib/stale";
+import { spawnNextOccurrenceOps, type SpawnOps } from "@/lib/recurrence-service";
 
 // The closed status set, kept local so app code does not import @prisma/client.
 type TaskStatus = "active" | "done" | "cancelled" | "someday";
@@ -308,20 +309,40 @@ export async function editTaskField(formData: FormData): Promise<void> {
       data = { status: raw as TaskStatus };
       undoData = { status: before.status };
       summary = `“${before.title}” is ${raw}`;
+      // Completing stamps completed_at (and leaving done clears it), so habit
+      // history can read "last on <date>" and the ranking can weight recency.
+      if (raw === "done") {
+        data.completedAt = new Date();
+        undoData.completedAt = before.completedAt;
+      } else if (before.status === "done") {
+        data.completedAt = null;
+        undoData.completedAt = before.completedAt;
+      }
       break;
     }
     default:
       return;
   }
 
+  // WP8 · completing a recurring task spawns its next occurrence in the SAME
+  // write, so the completion and the next occurrence reverse together. Only on a
+  // move INTO done — cancelling or re-opening spawns nothing.
+  let spawn: SpawnOps | null = null;
+  if (field === "status" && raw === "done") {
+    spawn = await spawnNextOccurrenceOps(id);
+  }
+
   await mutate({
     actor: { kind: "user" },
     verb: `task.edit.${field}`,
     taskId: id,
-    summary,
+    summary: spawn ? `${summary} · ${spawn.summary}` : summary,
     filterKind: field === "dueDate" || field === "deferUntil" ? "dates" : null,
-    undo: { ops: [{ action: "update", model: "task", id, data: undoData }] },
-    apply: (tx) => tx.task.update({ where: { id }, data }),
+    undo: { ops: [...(spawn?.undo ?? []), { action: "update", model: "task", id, data: undoData }] },
+    apply: async (tx) => {
+      await tx.task.update({ where: { id }, data });
+      if (spawn) await spawn.run(tx);
+    },
   });
 
   revalidatePath("/board");

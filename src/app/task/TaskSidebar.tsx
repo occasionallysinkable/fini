@@ -316,6 +316,9 @@ export function TaskSidebar({
               {populated("notes") && <SectionHeading>Notes</SectionHeading>}
               <NotesSection data={data} setData={setData} />
 
+              {/* ---- Habit completion history (R18) -------------------------- */}
+              {data.habitHistory && <HabitHistorySection data={data} />}
+
               {/* ---- History (last, collapsed) ------------------------------- */}
               {data.historyCount > 0 && <HistorySection data={data} />}
             </>
@@ -799,6 +802,26 @@ function NotesSection({
             className="w-full rounded border border-accent bg-surface px-1.5 py-0.5 text-sm outline-none"
           />
         )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Habit completion history (R18) — "done N times · last on <date>", and nothing
+// else: no pace, no target, no streak. A habit is a recurring task nobody is
+// waiting on, so the honest thing to show is what has happened, not a scoreboard.
+// ---------------------------------------------------------------------------
+
+function HabitHistorySection({ data }: { data: TaskPageData }) {
+  const h = data.habitHistory!;
+  const times = `done ${h.doneCount} time${h.doneCount === 1 ? "" : "s"}`;
+  const last = h.lastDoneIso ? ` · last on ${fmtDate(h.lastDoneIso)}` : "";
+  return (
+    <div className="mt-6">
+      <div className="text-xs font-semibold uppercase tracking-wide text-muted">Completion history</div>
+      <div className="mt-1 text-sm">
+        {h.doneCount === 0 ? "not done yet" : `${times}${last}`}
       </div>
     </div>
   );

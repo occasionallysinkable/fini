@@ -14,6 +14,12 @@ import {
 } from "@/lib/queries";
 import { parse, inferKind, todayInZone, weekdayOf, type Role, type Kind } from "@/lib/parse";
 import { getReminderSettings, planReminders, reminderCreateOps } from "@/lib/reminder-service";
+import { firstOccurrenceOnOrAfter, type RecurrenceSpec } from "@/lib/recurrence";
+import {
+  planCapturedRecurrence,
+  type RecurrenceTemplate,
+  type CapturedRecurrencePlan,
+} from "@/lib/recurrence-service";
 
 async function requireUser() {
   const session = await auth();
@@ -97,28 +103,87 @@ export async function captureTask(
   // A new task lands at the end of its project's order (WP3 position).
   const position = await nextTaskPosition(leafProjectId);
 
+  const reminderSettings = await getReminderSettings();
+
+  // WP8 · recurrence. When the line carried an `every`/`every!` token, capture
+  // creates the rule and the FIRST occurrence together. The recurrence supplies
+  // the occurrence's date — so a bare "at 9am" that the parser read as a due time
+  // today becomes the time on the first scheduled date, not today. The date lands
+  // on due_date for a deadline (a due time/keyword, or a commitment) and on
+  // do_date otherwise (a habit is a day you work on it, placed by the app).
+  let recurrencePlan: CapturedRecurrencePlan | null = null;
+  // Effective dates the reminders and the task columns key off. Default to the
+  // parser's own reading; recurrence overrides them below.
+  let occDueDate: Date | null = p.dueDate ? isoToDate(p.dueDate) : null;
+  let occDoDate: Date | null = p.doDate ? isoToDate(p.doDate) : null;
+  let occDoDateSetBy: "user" | "app" | null = p.doDate ? "user" : null;
+  let occurrenceDate: Date | null = null;
+  let recurrenceRuleId: string | null = null;
+  let reminderDueDateIso: string | null = p.dueDate;
+
+  if (p.recurrence) {
+    const spec: RecurrenceSpec = {
+      pattern: p.recurrence.pattern,
+      weekdays: p.recurrence.weekdays,
+      dayOfMonth: p.recurrence.dayOfMonth,
+      n: p.recurrence.n,
+      mode: p.recurrence.mode,
+    };
+    const firstDate = firstOccurrenceOnOrAfter(spec, ctx.today);
+    const dateKind: "due" | "do" =
+      p.dueTime || p.dueKeyword || kind === "commitment" ? "due" : "do";
+    const template: RecurrenceTemplate = {
+      title: p.title,
+      projectId: leafProjectId,
+      categoryId: null,
+      kind,
+      kindIsExplicit: p.kindExplicit,
+      reason: p.reason,
+      estimateMinutes: p.estimateGiven ? p.estimateMinutes : null,
+      splittable: p.chunking?.splittable ?? false,
+      minChunkMinutes: p.chunking?.minChunkMinutes ?? null,
+      dueTime: p.dueTime,
+      dateKind,
+      people: resolvedPeople.map((pp) => ({ personId: pp.id, role: pp.role })),
+      reminders: p.reminders.map((r) =>
+        r.absoluteTime
+          ? ({ kind: "absolute", time: r.absoluteTime } as const)
+          : ({ kind: "offset", offsetMinutes: r.offsetMinutes ?? 0 } as const)
+      ),
+    };
+    recurrencePlan = planCapturedRecurrence({ spec, today: ctx.today, template, firstDate });
+    occDueDate = recurrencePlan.occurrence.dueDate;
+    occDoDate = recurrencePlan.occurrence.doDate;
+    occDoDateSetBy = recurrencePlan.occurrence.doDateSetBy;
+    occurrenceDate = recurrencePlan.occurrence.occurrenceDate;
+    recurrenceRuleId = recurrencePlan.ruleId;
+    reminderDueDateIso = dateKind === "due" ? firstDate : null;
+  }
+
   // WP7 · reminders you set. The parser already read the '+' tokens (R16); here
   // they become real Reminder rows with their fire instants computed in the
   // user's zone. The default-reminder toggle adds one when it is on and the user
-  // named none — nothing arms itself otherwise (reminders are opt in).
-  const reminderSettings = await getReminderSettings();
+  // named none — nothing arms itself otherwise (reminders are opt in). With a
+  // recurrence, the first occurrence's date is what they fire against.
   const plannedReminders = planReminders({
-    dueDate: p.dueDate,
+    dueDate: reminderDueDateIso,
     dueTime: p.dueTime,
-    fallbackDate: ctx.today,
+    fallbackDate: recurrencePlan ? recurrencePlan.firstDate : ctx.today,
     timeZone: reminderSettings.timeZone,
     typed: p.reminders.map((r) => ({ offsetMinutes: r.offsetMinutes, absoluteTime: r.absoluteTime })),
     defaultReminder: reminderSettings.defaultReminder,
   });
   const reminderOps = reminderCreateOps(taskId, plannedReminders);
 
-  // Reversal, in FK-safe order: reminders and links, then task, then anything
-  // this capture newly created (people, then projects leaf→root).
+  // Reversal, in FK-safe order: reminders and links, then task, then the rule
+  // (the task points at it), then anything this capture newly created (people,
+  // then projects leaf→root).
   const undoOps: UndoOp[] = [
     ...reminderOps.undo,
     { action: "deleteWhere", model: "taskPerson", where: { taskId } },
     { action: "deleteRow", model: "task", id: taskId },
   ];
+  if (recurrencePlan) undoOps.push(recurrencePlan.ruleUndo);
   for (const person of resolvedPeople) {
     if (!person.existing) undoOps.push({ action: "deleteRow", model: "person", id: person.id });
   }
@@ -145,6 +210,20 @@ export async function captureTask(
           await tx.person.create({ data: { id: person.id, name: person.name } });
         }
       }
+      // The rule is created before the task that points at it (WP8).
+      if (recurrencePlan) {
+        await tx.recurrenceRule.create({
+          data: {
+            id: recurrencePlan.ruleData.id,
+            pattern: recurrencePlan.ruleData.pattern,
+            weekdays: recurrencePlan.ruleData.weekdays,
+            dayOfMonth: recurrencePlan.ruleData.dayOfMonth,
+            n: recurrencePlan.ruleData.n,
+            mode: recurrencePlan.ruleData.mode,
+            template: recurrencePlan.ruleData.template as unknown as object,
+          },
+        });
+      }
       const task = await tx.task.create({
         data: {
           id: taskId,
@@ -155,9 +234,11 @@ export async function captureTask(
           kindIsExplicit: p.kindExplicit,
           reason: p.reason,
           source: "typed",
-          doDate: p.doDate ? isoToDate(p.doDate) : null,
-          doDateSetBy: p.doDate ? "user" : null,
-          dueDate: p.dueDate ? isoToDate(p.dueDate) : null,
+          recurrenceRuleId,
+          occurrenceDate,
+          doDate: occDoDate,
+          doDateSetBy: occDoDateSetBy,
+          dueDate: occDueDate,
           dueTime: p.dueTime,
           deferUntil: p.deferUntil ? isoToDate(p.deferUntil) : null,
           estimateMinutes: p.estimateGiven ? p.estimateMinutes : null,
