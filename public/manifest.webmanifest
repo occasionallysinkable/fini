@@ -1,0 +1,10 @@
+{
+  "name": "fini",
+  "short_name": "fini",
+  "description": "Push-proof harness for WP7.",
+  "start_url": "/push-check",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff"
+}
