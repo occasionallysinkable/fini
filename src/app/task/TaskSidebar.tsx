@@ -18,6 +18,8 @@ import {
   editTaskPageField,
   addTaskPerson,
   addTaskNote,
+  addReminder,
+  removeReminder,
   setSidebarWidth,
   type EditField,
 } from "./actions";
@@ -306,9 +308,9 @@ export function TaskSidebar({
               {populated("who") && <SectionHeading>Who</SectionHeading>}
               <WhoSection data={data} setData={setData} />
 
-              {/* ---- Reminders (WP7 shell) ----------------------------------- */}
+              {/* ---- Reminders ----------------------------------------------- */}
               {populated("reminders") && <SectionHeading>Reminders</SectionHeading>}
-              <RemindersSection data={data} />
+              <RemindersSection data={data} setData={setData} />
 
               {/* ---- Notes --------------------------------------------------- */}
               {populated("notes") && <SectionHeading>Notes</SectionHeading>}
@@ -572,27 +574,156 @@ function WhoSection({
 }
 
 // ---------------------------------------------------------------------------
-// Reminders — WP7 shell, list-only. WP6 has NO "add a reminder" control: R6's
-// rule is that pressing the control word turns it into the field, and the add
-// flow (presets, custom offsets, the service worker) plus the estimate-derived
-// line and the blocker suspension line are all WP7/WP15 — so a present but dead
-// control would break that rule harder than an absent section does. With no
-// reminders attached the section is absent entirely (its heading is gated on
-// `populated`, and this returns null); when reminders exist it lists them
-// read-only. WP7 adds the control when it adds the flow.
+// Reminders (WP7). Lists the reminders on the task, each with its computed fire
+// time and a remove control, and offers the add flow: the four presets when a
+// due time exists (they are offsets from it), a Custom absolute reminder always,
+// and — when there is no due time — the one quiet caption reminders.md calls for
+// in place of the presets. Reminders are opt in: nothing is added unless pressed.
 // ---------------------------------------------------------------------------
 
-function RemindersSection({ data }: { data: TaskPageData }) {
-  if (data.reminders.length === 0) return null;
+const REMINDER_PRESETS: { id: string; label: string }[] = [
+  { id: "1d", label: "1 day before" },
+  { id: "30m", label: "30 min before" },
+  { id: "15m", label: "15 min before" },
+  { id: "at", label: "at the due time" },
+];
+
+function RemindersSection({
+  data,
+  setData,
+}: {
+  data: TaskPageData;
+  setData: (d: TaskPageData | null) => void;
+}) {
+  const [pending, startTransition] = useTransition();
+  const [adding, setAdding] = useState(false);
+  const [custom, setCustom] = useState(false);
+  const [date, setDate] = useState("");
+  const [time, setTime] = useState("");
+
+  const reset = () => {
+    setAdding(false);
+    setCustom(false);
+    setDate("");
+    setTime("");
+  };
+
+  const addPreset = (presetId: string) => {
+    startTransition(async () => {
+      const fresh = await addReminder({ id: data.id, presetId });
+      setData(fresh);
+      reset();
+    });
+  };
+
+  const addCustom = () => {
+    if (!date || !time) return;
+    startTransition(async () => {
+      const fresh = await addReminder({ id: data.id, absoluteDate: date, absoluteTime: time });
+      setData(fresh);
+      reset();
+    });
+  };
+
+  const remove = (reminderId: string) => {
+    startTransition(async () => {
+      const fresh = await removeReminder({ id: data.id, reminderId });
+      setData(fresh);
+    });
+  };
+
+  const hasDueTime = !!data.dueTime;
+
   return (
     <div>
       {data.reminders.map((r) => (
         <Field key={r.id} label={r.label}>
-          <span className="text-muted">
-            {r.when ?? (r.isStart ? "computed from the estimate" : "—")}
+          <span className="inline-flex items-center gap-2">
+            <span className="text-muted">
+              {r.when ?? (r.isStart ? "computed from the estimate" : "—")}
+            </span>
+            {/* The start reminder's own removal warning is WP13; a reminder you set
+                removes silently (reminders.md). */}
+            {!r.isStart && (
+              <button
+                type="button"
+                disabled={pending}
+                onClick={() => remove(r.id)}
+                className="text-xs text-muted hover:text-accent"
+              >
+                remove
+              </button>
+            )}
           </span>
         </Field>
       ))}
+
+      <div className="mt-2 text-sm">
+        {!adding ? (
+          <button type="button" onClick={() => setAdding(true)} className="text-accent hover:underline">
+            add a reminder
+          </button>
+        ) : custom ? (
+          // Custom takes an absolute date and time and stays where you put it.
+          <span className="inline-flex flex-wrap items-center gap-2">
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="rounded border border-accent bg-surface px-1.5 py-0.5 text-sm outline-none"
+            />
+            <input
+              type="time"
+              value={time}
+              onChange={(e) => setTime(e.target.value)}
+              className="rounded border border-accent bg-surface px-1.5 py-0.5 text-sm outline-none"
+            />
+            <button
+              type="button"
+              disabled={pending || !date || !time}
+              onClick={addCustom}
+              className="text-accent hover:underline disabled:opacity-40"
+            >
+              add
+            </button>
+            <button type="button" onClick={reset} className="text-xs text-muted hover:text-text">
+              cancel
+            </button>
+          </span>
+        ) : (
+          <span className="inline-flex flex-wrap items-center gap-3">
+            {hasDueTime ? (
+              REMINDER_PRESETS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  disabled={pending}
+                  onClick={() => addPreset(p.id)}
+                  className="text-accent hover:underline"
+                >
+                  {p.label}
+                </button>
+              ))
+            ) : (
+              // No due time: the presets have nothing to be N minutes before, so a
+              // single quiet caption stands in their place (reminders.md / R25).
+              <span className="text-xs text-muted">
+                {data.dueDate ? "add a due time for presets" : "add a due date for presets"}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => setCustom(true)}
+              className="text-accent hover:underline"
+            >
+              Custom…
+            </button>
+            <button type="button" onClick={reset} className="text-xs text-muted hover:text-text">
+              cancel
+            </button>
+          </span>
+        )}
+      </div>
     </div>
   );
 }
