@@ -4,7 +4,8 @@ import { isAvailable } from "./availability";
 import { isReviewDue } from "./review";
 import { collectProjectSubtree } from "./projects";
 import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
-import { fmtMinutes, type TaskPageData } from "./task-page";
+import type { TaskPageData } from "./task-page";
+import { reminderLabel, formatFireTime } from "./reminders";
 import {
   KEEP_VERB,
   UNDO_VERB,
@@ -43,6 +44,25 @@ export function getRecentActivity() {
 
 export function getTask(id: string) {
   return prisma.task.findUnique({ where: { id } });
+}
+
+/** One reminder row, for the remove action's undo (restore enabled + fire time). */
+export function getReminder(id: string) {
+  return prisma.reminder.findUnique({ where: { id } });
+}
+
+/** One device by its push endpoint, for the subscribe action's undo. */
+export function getDeviceByEndpoint(endpoint: string) {
+  return prisma.device.findUnique({ where: { endpoint } });
+}
+
+/** The live reminders on a task — for rescheduling when the due date/time moves,
+ *  and for the fields their undo needs. */
+export function getEnabledReminders(taskId: string) {
+  return prisma.reminder.findMany({
+    where: { taskId, enabled: true },
+    select: { id: true, offsetMinutes: true, absoluteAt: true, nextFireAtUtc: true },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -277,26 +297,26 @@ export async function getBoardData(): Promise<BoardData> {
 // objects) so the client sidebar receives a plain, serialisable payload.
 // ---------------------------------------------------------------------------
 
-/** A plain label for a reminder in the WP6 shell. WP7 computes real times and the
- *  "computed from the estimate" line; here it is enough to name it. */
-function reminderLabel(offsetMinutes: number | null): string {
-  if (offsetMinutes == null) return "At the due time";
-  return `${fmtMinutes(offsetMinutes)} before`;
-}
-
 export async function getTaskPageData(id: string): Promise<TaskPageData | null> {
-  const t = await prisma.task.findFirst({
-    where: { id, deletedAt: null },
-    include: {
-      project: { select: { name: true } },
-      taskPeople: {
-        include: { person: { select: { id: true, name: true, timezone: true } } },
+  const [t, user] = await Promise.all([
+    prisma.task.findFirst({
+      where: { id, deletedAt: null },
+      include: {
+        project: { select: { name: true } },
+        taskPeople: {
+          include: { person: { select: { id: true, name: true, timezone: true } } },
+        },
+        notes: { orderBy: { createdAt: "desc" } },
+        // Only live reminders: removing one disables it (invariant 2 — no
+        // destructive delete), so a removed reminder is enabled:false and gone
+        // from the list, and undo re-enables it.
+        reminders: { where: { enabled: true }, orderBy: { createdAt: "asc" } },
       },
-      notes: { orderBy: { createdAt: "desc" } },
-      reminders: { orderBy: { createdAt: "asc" } },
-    },
-  });
+    }),
+    prisma.user.findFirst({ select: { timezone: true } }),
+  ]);
   if (!t) return null;
+  const timeZone = user?.timezone ?? "UTC";
 
   // History is last and collapsed (R6): the most recent entries plus a total
   // count. It reads the activity log, adding no store of its own.
@@ -325,8 +345,8 @@ export async function getTaskPageData(id: string): Promise<TaskPageData | null> 
     })),
     reminders: t.reminders.map((r) => ({
       id: r.id,
-      label: r.isStartReminder ? "Start reminder" : reminderLabel(r.offsetMinutes),
-      when: null,
+      label: reminderLabel(r),
+      when: formatFireTime(r.nextFireAtUtc, timeZone),
       isStart: r.isStartReminder,
     })),
     notes: t.notes.map((n) => ({ id: n.id, body: n.body })),
@@ -338,6 +358,40 @@ export async function getTaskPageData(id: string): Promise<TaskPageData | null> 
     })),
     historyCount,
   };
+}
+
+export interface ArmedReminder {
+  id: string;
+  taskId: string;
+  taskTitle: string;
+  label: string;
+  when: string;
+}
+
+/**
+ * Every reminder that is armed and will fire, in time order (reminders.md ·
+ * "Seeing what will fire"): enabled, with a fire time still set, on a live active
+ * task. This answers the first question anyone asks a reminder feature — did that
+ * actually save, and what is going to wake me. Reminders that already fired have
+ * next_fire cleared, so they drop off this list.
+ */
+export async function getArmedReminders(): Promise<ArmedReminder[]> {
+  const [reminders, user] = await Promise.all([
+    prisma.reminder.findMany({
+      where: { enabled: true, nextFireAtUtc: { not: null }, task: { deletedAt: null, status: "active" } },
+      orderBy: { nextFireAtUtc: "asc" },
+      include: { task: { select: { id: true, title: true } } },
+    }),
+    prisma.user.findFirst({ select: { timezone: true } }),
+  ]);
+  const timeZone = user?.timezone ?? "UTC";
+  return reminders.map((r) => ({
+    id: r.id,
+    taskId: r.task.id,
+    taskTitle: r.task.title,
+    label: reminderLabel(r),
+    when: formatFireTime(r.nextFireAtUtc, timeZone),
+  }));
 }
 
 /** The tasks named by a bulk selection, with just the fields an undo payload

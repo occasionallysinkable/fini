@@ -17,10 +17,12 @@ import {
   getDeletedTasks,
   getRecentActivity,
   getStandaloneNotes,
+  getArmedReminders,
   buildCaptureContext,
 } from "@/lib/queries";
 import { renameTask, deleteTask, addNote, undoActivity } from "./actions";
 import { CaptureBox } from "./CaptureBox";
+import { NotificationSetup } from "./notifications/NotificationSetup";
 
 function fmtDate(d: Date | null): string | null {
   return d ? d.toISOString().slice(0, 10) : null;
@@ -40,18 +42,20 @@ export default async function Home() {
     );
   }
 
-  const [available, tasks, deleted, activity, standaloneNotes, captureContext] =
+  const [available, tasks, deleted, activity, standaloneNotes, armedReminders, captureContext] =
     await Promise.all([
       getAvailableTasks(),
       getActiveTasksWithDetail(),
       getDeletedTasks(),
       getRecentActivity(),
       getStandaloneNotes(),
+      getArmedReminders(),
       buildCaptureContext(),
     ]);
 
   const now = Date.now();
   const availableIds = new Set(available.map((t) => t.id));
+  const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY ?? null;
 
   return (
     <main className="mx-auto max-w-2xl p-8">
@@ -77,8 +81,35 @@ export default async function Home() {
         availability derived on read.
       </p>
 
+      {/* WP7 — the persistent notification-setup line (reminders.md): it names
+          when this device is silent and offers the browser's permission prompt. */}
+      <section className="mt-6">
+        <NotificationSetup vapidPublicKey={vapidPublicKey} />
+      </section>
+
       <section className="mt-8">
         <CaptureBox context={captureContext} />
+      </section>
+
+      {/* WP7 — "seeing what will fire": every armed reminder in time order, so the
+          two questions a reminder feature has to answer (did it save, what will
+          wake me) are one glance. Fired reminders drop off (next_fire cleared). */}
+      <section className="mt-10">
+        <h2 className="text-muted">Armed reminders — what will fire</h2>
+        <ul className="mt-2 flex flex-col gap-1">
+          {armedReminders.length === 0 && (
+            <li className="text-muted">Nothing is armed. Reminders are opt in.</li>
+          )}
+          {armedReminders.map((r) => (
+            <li key={r.id} className="text-sm">
+              {r.taskTitle}
+              <span className="text-muted">
+                {" "}
+                · {r.label} · {r.when}
+              </span>
+            </li>
+          ))}
+        </ul>
       </section>
 
       {/* Availability is derived, never stored (invariant 4). This list is what

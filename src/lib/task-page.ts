@@ -31,8 +31,9 @@ export interface TaskPagePerson {
   role: Role;
 }
 
-/** A reminder as the page lists it. WP6 renders this read-only; WP7 owns adding
- *  and the estimate-derived line. `when` is the computed time text or null. */
+/** A reminder as the page lists it. WP7 owns adding and removing; the start
+ *  reminder's estimate-derived line is WP13. `when` is the computed fire time in
+ *  the user's zone, or a plain reason it cannot fire yet. */
 export interface TaskPageReminder {
   id: string;
   label: string;
@@ -98,15 +99,13 @@ export type SectionId = "when" | "howLong" | "who" | "reminders" | "notes";
  *  of this list IS the order the page draws — when, how long, who, reminders,
  *  notes — and nothing may reorder it.
  *
- *  Reminders carries a null control: WP6 has no add flow for it (that is WP7), and
- *  R6's rule is that pressing the control turns it into the field — so rather than
- *  draw a dead word, the reminders section is list-only and is absent entirely
- *  when empty. Every other section owns its add flow and always offers its word. */
+ *  WP7 gives reminders its own add flow, so it now carries a control like every
+ *  other section — "add a reminder" — and the section always offers it (R6). */
 export const SECTION_META: { id: SectionId; heading: string; control: string | null }[] = [
   { id: "when", heading: "When", control: "add a date" },
   { id: "howLong", heading: "How long", control: "add an estimate" },
   { id: "who", heading: "Who", control: "add a person" },
-  { id: "reminders", heading: "Reminders", control: null },
+  { id: "reminders", heading: "Reminders", control: "add a reminder" },
   { id: "notes", heading: "Notes", control: "add a note" },
 ];
 
