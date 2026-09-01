@@ -6,6 +6,7 @@ import { collectProjectSubtree } from "./projects";
 import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
 import type { TaskPageData } from "./task-page";
 import { reminderLabel, formatFireTime } from "./reminders";
+import { getHabitHistory } from "./recurrence-service";
 import {
   KEEP_VERB,
   UNDO_VERB,
@@ -325,6 +326,11 @@ export async function getTaskPageData(id: string): Promise<TaskPageData | null> 
     prisma.activity.count({ where: { taskId: id } }),
   ]);
 
+  // WP8 · a habit on a rule shows completion history only (R18), counted across
+  // every occurrence of its series.
+  const habitHistory =
+    t.kind === "habit" && t.recurrenceRuleId ? await getHabitHistory(t.recurrenceRuleId) : null;
+
   return {
     id: t.id,
     title: t.title,
@@ -357,6 +363,7 @@ export async function getTaskPageData(id: string): Promise<TaskPageData | null> 
       summary: a.summary,
     })),
     historyCount,
+    habitHistory,
   };
 }
 

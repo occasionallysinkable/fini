@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { fireDueReminders } from "@/lib/reminder-service";
+import { rollMissedOccurrences } from "@/lib/recurrence-service";
 
 /*
   WP7 · the tick endpoint. A Cloudflare Worker cron trigger posts here every
@@ -28,6 +29,10 @@ export async function POST(req: Request) {
   if (!authorized(req)) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
-  const result = await fireDueReminders(new Date());
-  return NextResponse.json({ ok: true, ...result });
+  const now = new Date();
+  // WP8 · collapse any missed recurring occurrences before firing, so a skipped
+  // habit's reminder does not fire against a date that has already passed.
+  const roll = await rollMissedOccurrences(now);
+  const result = await fireDueReminders(now);
+  return NextResponse.json({ ok: true, ...result, skipped: roll.skipped });
 }

@@ -152,8 +152,9 @@ export default async function Home() {
             const defer = fmtDate(t.deferUntil);
             if (defer) facts.push(`deferred to ${defer}`);
             if (t.estimateMinutes != null) facts.push(`${t.estimateMinutes}m`);
-            // State reads as words (invariant 7): say plainly when a task is not
-            // on the day and why the reader can infer from the facts above.
+            // State reads as words (invariant 7): a recurring occurrence says so,
+            // and a task off the day says why the reader can infer from the facts.
+            if (t.recurrenceRuleId) facts.push("recurring");
             if (!availableIds.has(t.id) && t.status === "active") facts.push("not available");
             return (
               <li key={t.id} className="border-b border-line pb-3">

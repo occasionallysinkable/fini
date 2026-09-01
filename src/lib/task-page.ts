@@ -87,6 +87,11 @@ export interface TaskPageData {
   // History — collapsed, with a count (reads the activity rows WP1 writes)
   history: TaskPageHistoryEntry[];
   historyCount: number;
+
+  /** WP8 · a habit shows its completion history and nothing else (R18): "done N
+   *  times · last on <date>". Present only for a habit on a recurrence rule; no
+   *  pace, no target, no streak. Null for every other task. */
+  habitHistory: { doneCount: number; lastDoneIso: string | null } | null;
 }
 
 // ---------------------------------------------------------------------------

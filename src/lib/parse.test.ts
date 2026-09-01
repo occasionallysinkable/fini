@@ -355,6 +355,51 @@ describe("R17 · kind is inferred and the cause is printed", () => {
   });
 });
 
+describe("WP8 · recurrence parses to the five structured patterns", () => {
+  it("every 1st → monthly_date with the day", () => {
+    const r = parse("Pay rent every 1st", ctx()).recurrence!;
+    expect(r.pattern).toBe("monthly_date");
+    expect(r.dayOfMonth).toBe(1);
+    expect(r.mode).toBe("fixed");
+  });
+
+  it("every day → daily, every weekday → weekdays", () => {
+    expect(parse("Stretch every day", ctx()).recurrence!.pattern).toBe("daily");
+    expect(parse("Standup every weekdays", ctx()).recurrence!.pattern).toBe("weekdays");
+  });
+
+  it("every Monday → weekly on Monday (index 1)", () => {
+    const r = parse("Call mum every monday", ctx()).recurrence!;
+    expect(r.pattern).toBe("weekly");
+    expect(r.weekdays).toEqual([false, true, false, false, false, false, false]);
+  });
+
+  it("every 2 weeks → every_n_weeks n=2", () => {
+    const r = parse("Bins every 2 weeks", ctx()).recurrence!;
+    expect(r.pattern).toBe("every_n_weeks");
+    expect(r.n).toBe(2);
+  });
+
+  it("every!7d → every_n_weeks n=1, after completion (the plants)", () => {
+    const r = parse("Water plants every!7d", ctx()).recurrence!;
+    expect(r.pattern).toBe("every_n_weeks");
+    expect(r.n).toBe(1);
+    expect(r.mode).toBe("after_completion");
+  });
+
+  it("every 1d → daily", () => {
+    expect(parse("Journal every 1d", ctx()).recurrence!.pattern).toBe("daily");
+  });
+
+  it("a day interval that is not one of the five stays in the title", () => {
+    // "every 3d" is neither daily nor a whole number of weeks: not persisted, and
+    // the words are not discarded (invariant 13).
+    const r = parse("Odd thing every 3d", ctx());
+    expect(r.recurrence).toBeNull();
+    expect(r.title).toContain("every 3d");
+  });
+});
+
 describe("R15 · one caption when a due time is outside every shift", () => {
   const day: ShiftWindow = {
     name: "Day",

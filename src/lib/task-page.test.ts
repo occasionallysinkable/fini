@@ -61,6 +61,7 @@ function tp(over: Partial<TaskPageData> = {}): TaskPageData {
     notes: [],
     history: [],
     historyCount: 0,
+    habitHistory: null,
     ...over,
   };
 }

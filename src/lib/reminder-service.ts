@@ -1,6 +1,7 @@
 import { prisma } from "./prisma";
 import { mutate, type UndoOp } from "./mutate";
 import { sendToAllDevices } from "./push";
+import { spawnNextOccurrenceOps } from "./recurrence-service";
 import {
   computeFireTime,
   reminderTag,
@@ -318,16 +319,23 @@ async function completeFromNotification(taskId: string, now: Date): Promise<Acti
     return { ok: true, message: "Already done.", closedTags: reminders.map((r) => reminderTag(r.id)) };
   }
 
+  // WP8 · completing a recurring task from the lock screen spawns its next
+  // occurrence in the same write, exactly as completing it on the board does.
+  const spawn = await spawnNextOccurrenceOps(taskId, now);
+
   await mutate({
     actor: { kind: "user" },
     verb: "reminder.done",
     taskId,
     filterKind: "reminders",
-    summary: `Completed “${task.title}” from a reminder`,
-    undo: { ops: undo },
+    summary: spawn
+      ? `Completed “${task.title}” from a reminder · ${spawn.summary}`
+      : `Completed “${task.title}” from a reminder`,
+    undo: { ops: [...(spawn?.undo ?? []), ...undo] },
     apply: async (tx) => {
       await tx.task.update({ where: { id: taskId }, data: { status: "done", completedAt: now } });
       await tx.reminder.updateMany({ where: { taskId }, data: { enabled: false, nextFireAtUtc: null } });
+      if (spawn) await spawn.run(tx);
     },
   });
 

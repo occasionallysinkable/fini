@@ -19,7 +19,8 @@
     "db:capture-roundtrip": "dotenv -e .env.local -- tsx scripts/capture-roundtrip.ts",
     "db:wp3-roundtrip": "dotenv -e .env.local -- tsx scripts/wp3-roundtrip.ts",
     "db:wp5-stale-demo": "dotenv -e .env.local -- tsx scripts/wp5-stale-demo.ts",
-    "db:wp5-stale-roundtrip": "dotenv -e .env.local -- tsx scripts/wp5-stale-roundtrip.ts"
+    "db:wp5-stale-roundtrip": "dotenv -e .env.local -- tsx scripts/wp5-stale-roundtrip.ts",
+    "db:wp8-recurrence-roundtrip": "dotenv -e .env.local -- tsx scripts/wp8-recurrence-roundtrip.ts"
   },
   "prisma": {
     "seed": "dotenv -e .env.local -- tsx prisma/seed.ts"
