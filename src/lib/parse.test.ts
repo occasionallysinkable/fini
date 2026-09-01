@@ -260,14 +260,14 @@ describe("invariant 10 · today resolves in the user's zone, not the UTC date", 
 describe("a deadline preposition claims the whole date-and-time phrase", () => {
   it("claims a date + time in either order", () => {
     const a = parse("Send it before 8pm next sunday", ctx());
-    expect(a.dueDate).toBe("2026-08-09"); // next Sunday from Friday
+    expect(a.dueDate).toBe("2026-08-16"); // "next Sunday" = the FOLLOWING week (from Friday the 7th)
     expect(a.dueTime).toBe("20:00");
     expect(a.dueKeyword).toBe("before");
     expect(a.doDate).toBeNull();
     expect(a.title).toBe("Send it");
 
     const b = parse("Send it before next sunday 8pm", ctx());
-    expect(b.dueDate).toBe("2026-08-09");
+    expect(b.dueDate).toBe("2026-08-16");
     expect(b.dueTime).toBe("20:00");
     expect(b.doDate).toBeNull();
     expect(b.title).toBe("Send it");
@@ -291,7 +291,7 @@ describe("a deadline preposition claims the whole date-and-time phrase", () => {
       ctx()
     );
     expect(r.title).toBe("Send updated email to MI");
-    expect(r.dueDate).toBe("2026-08-09");
+    expect(r.dueDate).toBe("2026-08-16"); // "next sunday" = following week
     expect(r.dueTime).toBe("20:00");
     expect(r.doDate).toBeNull();
     expect(r.estimateMinutes).toBe(35);
@@ -301,8 +301,17 @@ describe("a deadline preposition claims the whole date-and-time phrase", () => {
 
   it("consumes 'next' so it never survives into the title", () => {
     const r = parse("Water plants next sunday", ctx());
-    expect(r.doDate).toBe("2026-08-09");
+    expect(r.doDate).toBe("2026-08-16"); // following week
     expect(r.title).toBe("Water plants");
+  });
+
+  it("'next <weekday>' is a full week past the coming one (today is Friday 7 Aug)", () => {
+    // Bare weekday: the coming occurrence; on its own day, today.
+    expect(parse("x Friday", ctx()).doDate).toBe("2026-08-07"); // today
+    expect(parse("x Monday", ctx()).doDate).toBe("2026-08-10"); // this coming Monday
+    // "next <weekday>": always the following week's occurrence.
+    expect(parse("x next Friday", ctx()).doDate).toBe("2026-08-14"); // a week from today
+    expect(parse("x next Monday", ctx()).doDate).toBe("2026-08-17"); // a week past the coming Monday
   });
 });
 
