@@ -250,6 +250,7 @@ Reminders that already fired are not listed here. They belong to the Activity pa
 | Chasing a passed expected‑by date | The only notification that would have been about somebody else's obligation rather than your own work. The planning queue already sees the passed date and can raise it at the hour you plan, which costs no new notification. |
 | A reminder on a do date | A day you picked for yourself is a plan. If you want warning before it, add a reminder. |
 | Free text on a snooze | The three canned reasons are the whole set on a notification. Typing on a lock screen is not a thing anyone does. |
+| The three snooze reasons, and the second‑snooze interval row, ON the notification | Corrected against the platform when WP7 was tested on a real phone. Windows and Android Chrome — the only platforms in scope — render at most **two** notification action buttons (`Notification.maxActions === 2`), so a three‑reason screen can never fully show there, and re‑showing the notification to morph its buttons was unreliable and confusing in practice. v1 ships two flat actions: **Done** (completes the task) and **Later** (reschedules by the snooze interval), each resolved on the server so it works from the lock screen, each printing a one‑line confirmation. Per‑snooze reason capture and the longer‑interval escalation move to v2, where they belong on an in‑app surface rather than a lock‑screen button that the platform cannot render. The snooze interval Setting and the reschedule behaviour are unchanged. |
 
 ## Still open
 
