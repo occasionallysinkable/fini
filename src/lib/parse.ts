@@ -183,13 +183,14 @@ function parseDate(expr: string, ctx: ParseContext): string | null {
   if (s === "tomorrow") return addDays(ctx.today, 1);
 
   // A weekday name → its next occurrence. R27: a plain weekday that names today
-  // means today. "next <weekday>" means the coming one, and when it names
-  // today it is a week away, not today.
+  // means today. "next <weekday>" always means the FOLLOWING week's occurrence —
+  // the coming one plus seven days — so "next Friday" said on a Tuesday is a week
+  // past this Friday, and "next Friday" said on a Friday is a week from today.
   const wdMatch = s.match(new RegExp(`^(next\\s+)?(${WEEKDAYS})$`));
   if (wdMatch) {
     const target = WEEKDAY_INDEX[wdMatch[2].slice(0, 3)];
-    let diff = (target - ctx.todayWeekday + 7) % 7; // 0 → today
-    if (wdMatch[1] && diff === 0) diff = 7; // "next" + today's weekday
+    let diff = (target - ctx.todayWeekday + 7) % 7; // 0 → today (bare weekday)
+    if (wdMatch[1]) diff += 7; // "next" pushes to the following week
     return addDays(ctx.today, diff);
   }
 
