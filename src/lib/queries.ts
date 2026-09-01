@@ -524,10 +524,13 @@ export function getStandaloneNotes() {
   return prisma.note.findMany({ where: { taskId: null }, orderBy: { createdAt: "desc" } });
 }
 
-/** Active tasks with their project and notes, for the management list. */
+/** Active tasks with their project and notes, for the home management list.
+ *  Only status = active: a completed or cancelled task leaves this list (it is
+ *  still on the board's completed filter), so ticking a task off — from the app
+ *  or from a reminder's Done — visibly clears it here too. */
 export function getActiveTasksWithDetail() {
   return prisma.task.findMany({
-    where: { deletedAt: null },
+    where: { deletedAt: null, status: "active" },
     orderBy: { createdAt: "desc" },
     include: { project: true, notes: { orderBy: { createdAt: "desc" } } },
   });
