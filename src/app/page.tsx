@@ -10,8 +10,9 @@
   the activity page (this package). The notification-setup line (WP7) stays too.
 */
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { auth } from "@/auth";
-import { getTodayData, getUserSettingsRow, buildCaptureContext } from "@/lib/queries";
+import { getTodayData, getUserSettingsRow, buildCaptureContext, getOnboardingState } from "@/lib/queries";
 import { readSidebarWidth } from "@/lib/task-page";
 import { LeftRail } from "./Nav";
 import { CaptureBox } from "./CaptureBox";
@@ -35,6 +36,12 @@ export default async function Home() {
       </main>
     );
   }
+
+  // R13: until the one onboarding question is answered, today has no honest
+  // shift to stand on. Send the user to the one-screen question first; it
+  // redirects straight back here once answered, and never appears again (R14).
+  const { needed } = await getOnboardingState();
+  if (needed) redirect("/welcome");
 
   const [data, userSettings, captureContext] = await Promise.all([
     getTodayData(),
