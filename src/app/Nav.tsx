@@ -21,7 +21,7 @@ const ENTRIES: { href: string; label: string; wired: boolean }[] = [
   { href: "/calendar", label: "calendar", wired: false },
   { href: "/board", label: "board", wired: true },
   { href: "/activity", label: "activity", wired: true },
-  { href: "/settings", label: "settings", wired: false },
+  { href: "/settings", label: "settings", wired: true },
 ];
 
 export function LeftRail() {
