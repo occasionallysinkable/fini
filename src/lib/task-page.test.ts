@@ -67,7 +67,15 @@ function tp(over: Partial<TaskPageData> = {}): TaskPageData {
 }
 
 function person(over: Partial<TaskPagePerson>): TaskPagePerson {
-  return { personId: "p", name: "Someone", timezone: null, role: "assignee", ...over };
+  return {
+    personId: "p",
+    name: "Someone",
+    timezone: null,
+    dayStart: null,
+    dayEnd: null,
+    role: "assignee",
+    ...over,
+  };
 }
 
 describe("the five sections", () => {

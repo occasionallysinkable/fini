@@ -17,12 +17,14 @@ import {
   loadTaskPage,
   editTaskPageField,
   addTaskPerson,
+  editPersonZone,
   addTaskNote,
   addReminder,
   removeReminder,
   setSidebarWidth,
   type EditField,
 } from "./actions";
+import type { TaskPagePerson } from "@/lib/task-page";
 
 /*
   WP6 · the task page, drawn as a sidebar over whatever is behind it (R6, R19).
@@ -521,10 +523,7 @@ function WhoSection({
           <div className="text-xs text-muted">{g.heading}</div>
           <ul className="text-sm">
             {g.people.map((p) => (
-              <li key={p.personId}>
-                {p.name}
-                {p.timezone && <span className="text-muted"> · {p.timezone}</span>}
-              </li>
+              <PersonRow key={p.personId} taskId={data.id} person={p} setData={setData} />
             ))}
           </ul>
         </div>
@@ -573,6 +572,112 @@ function WhoSection({
         )}
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// A person row (WP12). Shows the name and, for a commitment person, their zone —
+// the clock this task's deadline is read in (invariant 11). "zone" expands an
+// inline editor for the zone and working hours; saving recomputes every active
+// commitment of theirs, which is why the whole set can shift from one edit. People
+// are reached here, from the tasks that reference them (R19), not a people screen.
+// ---------------------------------------------------------------------------
+
+function PersonRow({
+  taskId,
+  person,
+  setData,
+}: {
+  taskId: string;
+  person: TaskPagePerson;
+  setData: (d: TaskPageData | null) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [pending, startTransition] = useTransition();
+  const [tz, setTz] = useState(person.timezone ?? "");
+  const [start, setStart] = useState(person.dayStart ?? "");
+  const [end, setEnd] = useState(person.dayEnd ?? "");
+
+  const save = () => {
+    startTransition(async () => {
+      const fresh = await editPersonZone({
+        taskId,
+        personId: person.personId,
+        timezone: tz,
+        dayStart: start,
+        dayEnd: end,
+      });
+      setData(fresh);
+      setEditing(false);
+    });
+  };
+
+  return (
+    <li className="py-0.5">
+      <span className="inline-flex flex-wrap items-center gap-2">
+        <span>{person.name}</span>
+        {person.timezone ? (
+          <span className="text-muted">· {person.timezone}</span>
+        ) : (
+          <span className="text-muted">· no zone</span>
+        )}
+        {person.dayStart && person.dayEnd && (
+          <span className="text-muted">
+            · {person.dayStart}–{person.dayEnd}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => setEditing((e) => !e)}
+          className="text-xs text-accent hover:underline"
+        >
+          {editing ? "close" : "zone"}
+        </button>
+      </span>
+
+      {editing && (
+        <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+          <input
+            value={tz}
+            placeholder="Area/City (e.g. Europe/Berlin)"
+            onChange={(e) => setTz(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                save();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                setEditing(false);
+              }
+            }}
+            className="w-56 rounded border border-accent bg-surface px-1.5 py-0.5 outline-none"
+          />
+          <span className="text-muted">day</span>
+          <input
+            type="time"
+            value={start}
+            onChange={(e) => setStart(e.target.value)}
+            className="rounded border border-line bg-surface px-1 py-0.5 outline-none"
+          />
+          <span className="text-muted">to</span>
+          <input
+            type="time"
+            value={end}
+            onChange={(e) => setEnd(e.target.value)}
+            className="rounded border border-line bg-surface px-1 py-0.5 outline-none"
+          />
+          <button
+            type="button"
+            disabled={pending}
+            onClick={save}
+            className="text-accent hover:underline disabled:opacity-40"
+          >
+            save
+          </button>
+        </div>
+      )}
+    </li>
   );
 }
 

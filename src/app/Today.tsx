@@ -372,6 +372,36 @@ export function Today({
           complete answer. */}
       {reasonFor && <ReasonRow pending={pending} onReason={doReason} onDismiss={() => setReasonFor(null)} />}
 
+      {/* The chain (WP12): today's deadline-bearing tasks ordered by the last
+          moment they can still be started. Read-only — you cannot drag a promise
+          (R8); it is moved on the task, not here. Each row carries the word
+          "deadline" so the meaning never rests on colour alone (R26). */}
+      {mode !== "choosing" && data.chain.length > 0 && (
+        <section className="mt-8">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted">The chain</h3>
+          <ul className="mt-2 flex flex-col">
+            {data.chain.map((c) => (
+              <li key={c.id} className="border-l-2 border-deadline py-2 pl-3">
+                <button
+                  type="button"
+                  onClick={() => setOpenTaskId(c.id)}
+                  className="text-left text-sm hover:text-accent"
+                >
+                  {c.title}
+                </button>
+                <div className="text-xs text-muted">
+                  <span className="font-medium text-deadline">deadline</span> {c.dueLabel}
+                  {" · "}
+                  {c.safeStartLabel
+                    ? `start by ${c.safeStartLabel}`
+                    : "add an estimate for a safe start"}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {/* The rest of today — a list you can read but not fiddle with. */}
       {mode !== "choosing" && rest.length > 0 && (
         <section className="mt-8">

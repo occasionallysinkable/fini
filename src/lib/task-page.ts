@@ -28,6 +28,10 @@ export interface TaskPagePerson {
   personId: string;
   name: string;
   timezone: string | null;
+  /** Working hours (R29-style HH:MM, or null). WP12 edits these on the task page,
+   *  since people are reached from the tasks that reference them (R19). */
+  dayStart: string | null;
+  dayEnd: string | null;
   role: Role;
 }
 
