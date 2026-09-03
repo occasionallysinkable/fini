@@ -1,5 +1,16 @@
 import { prisma } from "./prisma";
 import { todayInZone, weekdayOf, type ParseContext, type ShiftWindow } from "./parse";
+import {
+  routeTasks,
+  shiftLoad,
+  dayTotalMinutes,
+  isOnboarded,
+  readWakingHours,
+  weekdaysLabel,
+  type RoutableShift,
+  type RoutableTask,
+  type ShiftLoad,
+} from "./shifts";
 import { isAvailable } from "./availability";
 import { isReviewDue } from "./review";
 import { collectProjectSubtree } from "./projects";
@@ -880,4 +891,156 @@ export async function getActivityFirstPage(
 ): Promise<{ days: ReturnType<typeof groupByDay>; nextCursor: string | null; lines: ActivityStreamLine[] }> {
   const page = await getActivityStream(kind, null);
   return { days: groupByDay(page.lines), nextCursor: page.nextCursor, lines: page.lines };
+}
+
+// ---------------------------------------------------------------------------
+// WP11 · shifts, capacity, and the scheduled total. The shift table becomes
+// real here: onboarding writes the Day shift (R13), Settings adds more, and the
+// scheduled total / remaining / unestimated / day total are queries computed
+// from the tasks every time (invariant 3 — never stored). The arithmetic lives
+// in @/lib/shifts; these functions only fetch and shape.
+// ---------------------------------------------------------------------------
+
+/** The user row plus its shift count — enough to know whether onboarding is
+ *  still owed (R13/R14). One user row (invariant 12's single life). */
+export async function getOnboardingState(): Promise<{
+  needed: boolean;
+  userId: string | null;
+}> {
+  const [user, shiftCount] = await Promise.all([
+    prisma.user.findFirst({ select: { id: true, settings: true } }),
+    prisma.shift.count(),
+  ]);
+  if (!user) return { needed: false, userId: null };
+  return { needed: !isOnboarded(user.settings, shiftCount), userId: user.id };
+}
+
+export interface ShiftRow {
+  id: string;
+  name: string;
+  startTime: string;
+  endTime: string;
+  weekdays: boolean[];
+  weekdaysLabel: string;
+  capacityMinutes: number | null;
+  capacityFromWindow: boolean;
+  /** Whether the shift runs on today's weekday — an off-today shift holds no
+   *  work today, and its figures are shown as such rather than as an empty day. */
+  activeToday: boolean;
+  /** Category names this shift admits; empty means it takes everything (12). */
+  categoryNames: string[];
+  /** Today's load on this shift, computed (invariant 3). */
+  load: ShiftLoad;
+}
+
+export interface ShiftEditorData {
+  today: string; // YYYY-MM-DD in the user's zone
+  shifts: ShiftRow[];
+  /** Every category, for the add-a-shift form's picker (user-defined, 12). */
+  categories: { id: string; name: string }[];
+  /** The day total (Computed table): the sum of the day's shifts' scheduled
+   *  minutes. Displayed, refuses nothing. */
+  dayTotalMinutes: number;
+  waking: { start: string; end: string };
+}
+
+/**
+ * Everything the Settings shift editor renders: the shift rows with today's
+ * computed figures, the categories a new shift can be restricted to, the day
+ * total, and the waking-hours window (R29). Reads only — the scheduled total is
+ * derived here from the untimed tasks do-dated today, never read from a column.
+ */
+export async function getShiftEditorData(): Promise<ShiftEditorData> {
+  const user = await prisma.user.findFirst({
+    select: { timezone: true, wakingStart: true, wakingEnd: true },
+  });
+  const timezone = user?.timezone ?? "UTC";
+  const today = todayInZone(timezone);
+  const weekday = weekdayOf(today);
+  const todayDate = new Date(`${today}T00:00:00.000Z`);
+
+  const [shifts, categories, tasks] = await Promise.all([
+    prisma.shift.findMany({
+      orderBy: [{ startTime: "asc" }, { createdAt: "asc" }],
+      include: { shiftCategories: { include: { category: { select: { id: true, name: true } } } } },
+    }),
+    prisma.category.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+    // The untimed tasks placed on today: active, do-dated today, and NOT blocked
+    // out to a specific time (a block is charged by window overlap in WP14, not
+    // counted here). This is the whole of the scheduled total in stage 1.
+    prisma.task.findMany({
+      where: {
+        deletedAt: null,
+        status: "active",
+        doDate: todayDate,
+        blockStart: null,
+      },
+      select: { id: true, categoryId: true, estimateMinutes: true },
+    }),
+  ]);
+
+  const routableShifts: RoutableShift[] = shifts.map((sh) => ({
+    id: sh.id,
+    startMinutes: hhmmToMinutes(sh.startTime) ?? 0,
+    endMinutes: hhmmToMinutes(sh.endTime) ?? 0,
+    weekdays: sh.weekdays,
+    admittedCategoryIds: sh.shiftCategories.map((sc) => sc.categoryId),
+  }));
+  const routableTasks: RoutableTask[] = tasks.map((t) => ({
+    id: t.id,
+    categoryId: t.categoryId,
+    estimateMinutes: t.estimateMinutes,
+  }));
+
+  const { byShift } = routeTasks(routableShifts, routableTasks, weekday);
+
+  const rows: ShiftRow[] = shifts.map((sh) => {
+    const load = shiftLoad(byShift.get(sh.id) ?? [], sh.capacityMinutes);
+    return {
+      id: sh.id,
+      name: sh.name,
+      startTime: sh.startTime,
+      endTime: sh.endTime,
+      weekdays: sh.weekdays,
+      weekdaysLabel: weekdaysLabel(sh.weekdays),
+      capacityMinutes: sh.capacityMinutes,
+      capacityFromWindow: sh.capacityFromWindow,
+      activeToday: sh.weekdays[weekday],
+      categoryNames: sh.shiftCategories.map((sc) => sc.category.name),
+      load,
+    };
+  });
+
+  // The day total counts only shifts active today (a shift off today holds no
+  // work today), matching how the scheduled totals were routed.
+  const activeToday = rows.filter((r) => r.weekdays[weekday]);
+  const dayTotal = dayTotalMinutes(activeToday.map((r) => r.load));
+
+  return {
+    today,
+    shifts: rows,
+    categories,
+    dayTotalMinutes: dayTotal,
+    waking: readWakingHours({
+      wakingStart: user?.wakingStart ?? null,
+      wakingEnd: user?.wakingEnd ?? null,
+    }),
+  };
+}
+
+/** One shift row, for an edit action's undo payload. */
+export function getShift(id: string) {
+  return prisma.shift.findUnique({
+    where: { id },
+    include: { shiftCategories: true },
+  });
+}
+
+/** The user row a shift write needs: id, settings (for the onboarding flag) and
+ *  the waking window (R29, the Day shift's window). Read through the lib layer so
+ *  the write actions never import Prisma (the ESLint + runtime boundary). */
+export function getUserForShiftWrite() {
+  return prisma.user.findFirst({
+    select: { id: true, settings: true, wakingStart: true, wakingEnd: true },
+  });
 }

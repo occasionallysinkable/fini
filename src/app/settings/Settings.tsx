@@ -16,9 +16,9 @@ import {
   from an export). The screen also shows when the last export ran and whether the
   weekly nudge is currently outstanding.
 
-  The shift editor (R13) and the waking-hours / reminder settings (R29) are also
-  meant to live in Settings, but they belong to their own packages (WP11 and the
-  reminder settings); this screen is durability's home and names the seam.
+  The shift editor (R13) and the waking-hours setting (R29) now live above this
+  on the same Settings screen (WP11, ShiftEditor). This component stays the
+  durability half — export and restore.
 */
 
 function saveFile(payload: DownloadPayload, mime: string) {

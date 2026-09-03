@@ -8,8 +8,10 @@
 import Link from "next/link";
 import { auth } from "@/auth";
 import { getExportStatus } from "@/lib/export-service";
+import { getShiftEditorData } from "@/lib/queries";
 import { LeftRail } from "../Nav";
 import { Settings } from "./Settings";
+import { ShiftEditor } from "./ShiftEditor";
 
 export default async function SettingsPage() {
   const session = await auth();
@@ -26,7 +28,7 @@ export default async function SettingsPage() {
     );
   }
 
-  const status = await getExportStatus();
+  const [status, shiftData] = await Promise.all([getExportStatus(), getShiftEditorData()]);
 
   return (
     <div className="flex min-h-screen flex-col sm:flex-row">
@@ -34,6 +36,9 @@ export default async function SettingsPage() {
       <main className="mx-auto w-full max-w-2xl p-6 sm:p-8">
         <h1 className="text-lg font-semibold">Settings</h1>
         <div className="mt-6">
+          <ShiftEditor data={shiftData} />
+        </div>
+        <div className="mt-12 border-t border-line pt-8">
           <Settings status={status} />
         </div>
       </main>
