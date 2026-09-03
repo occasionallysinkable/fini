@@ -4,6 +4,7 @@ import {
   commitmentDueInstant,
   computeTaskDueInstant,
   safeStart,
+  startReminderFireAt,
   orderChain,
   type CommitmentPerson,
   type ChainInput,
@@ -156,6 +157,36 @@ describe("safeStart — due_at_utc − estimate_minutes", () => {
     // Due 01:00 UTC, needs 3h → safe start is 22:00 UTC the day before.
     const due = new Date("2026-09-04T01:00:00.000Z");
     expect(safeStart(due, 180)?.toISOString()).toBe("2026-09-03T22:00:00.000Z");
+  });
+});
+
+describe("startReminderFireAt — WP13, the start reminder's fire instant", () => {
+  it("is the safe start when there is a due instant and an estimate", () => {
+    const due = new Date("2026-09-04T15:00:00.000Z"); // 17:00 Berlin, say
+    expect(startReminderFireAt(due, 120)?.toISOString()).toBe("2026-09-04T13:00:00.000Z");
+  });
+
+  it("falls back to the due instant itself when there is no estimate", () => {
+    // Nothing to work backwards through, so the last honest warning is the
+    // deadline. The row is still armed (a commitment with a due date), not dropped.
+    const due = new Date("2026-09-04T15:00:00.000Z");
+    expect(startReminderFireAt(due, null)?.toISOString()).toBe("2026-09-04T15:00:00.000Z");
+  });
+
+  it("is null when there is no due instant (no due date → no start reminder)", () => {
+    expect(startReminderFireAt(null, 120)).toBeNull();
+    expect(startReminderFireAt(null, null)).toBeNull();
+  });
+
+  it("respects the governing zone, because it reads the due instant not a wall time", () => {
+    // due_at_utc for 00:00 (no due time) on 2026-09-04 in Asia/Karachi (UTC+5) is
+    // 2026-09-03T19:00Z. An untimed commitment with no estimate lands there — the
+    // reminders.md "00:00 on the due date" rule, in the person's zone, no special
+    // case in this function.
+    const untimedKarachi = commitmentDueInstant({ dueDate: "2026-09-04", dueTime: null, zone: "Asia/Karachi" });
+    expect(startReminderFireAt(untimedKarachi.dueAtUtc, null)?.toISOString()).toBe(
+      "2026-09-03T19:00:00.000Z"
+    );
   });
 });
 

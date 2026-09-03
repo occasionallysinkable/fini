@@ -19,6 +19,7 @@ import {
 } from "@/lib/queries";
 import { parse, inferKind, todayInZone, weekdayOf, type Role, type Kind } from "@/lib/parse";
 import { computeTaskDueInstant, type CommitmentPerson } from "@/lib/clock";
+import { planStartReminder, applyStartReminderPlan } from "@/lib/start-reminder-service";
 import { spawnNextOccurrenceOps } from "@/lib/recurrence-service";
 import { shortDate, overrideReason, type OverrideReasonCode } from "@/lib/today";
 import { getReminderSettings, planReminders, reminderCreateOps } from "@/lib/reminder-service";
@@ -222,11 +223,26 @@ export async function captureTask(
     userZone: reminderSettings.timeZone,
   });
 
+  // WP13 · the start reminder. A commitment with a due date is armed with one at
+  // capture (R22 — "on unless you remove it"), its fire instant the safe start off
+  // the due instant just computed. A brand-new task has no start reminder yet, so
+  // the plan is built against existing=null and only creates when the kind and the
+  // due date warrant it (own tasks and dateless commitments get nothing).
+  const startPlan = planStartReminder({
+    taskId,
+    kind,
+    dueAtUtc: dueInstant.dueAtUtc,
+    estimateMinutes: p.estimateGiven ? p.estimateMinutes : null,
+    existing: null,
+    newId: crypto.randomUUID(),
+  });
+
   // Reversal, in FK-safe order: reminders and links, then task, then the rule
   // (the task points at it), then anything this capture newly created (people,
   // then projects leaf→root).
   const undoOps: UndoOp[] = [
     ...reminderOps.undo,
+    ...startPlan.undo,
     { action: "deleteWhere", model: "taskPerson", where: { taskId } },
     { action: "deleteRow", model: "task", id: taskId },
   ];
@@ -303,6 +319,8 @@ export async function captureTask(
       for (const r of reminderOps.creates) {
         await tx.reminder.create({ data: r });
       }
+      // The start reminder is created after the task it points at (FK order).
+      await applyStartReminderPlan(tx, startPlan);
       return task;
     },
   });
