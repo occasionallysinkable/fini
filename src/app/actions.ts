@@ -7,12 +7,16 @@ import {
   getTask,
   getProjectById,
   getProjectDeletionSet,
+  getBlocker,
+  getOverride,
   nextTaskPosition,
   buildCaptureContext,
   resolveProjectPath,
   resolvePerson,
 } from "@/lib/queries";
 import { parse, inferKind, todayInZone, weekdayOf, type Role, type Kind } from "@/lib/parse";
+import { spawnNextOccurrenceOps } from "@/lib/recurrence-service";
+import { shortDate, overrideReason, type OverrideReasonCode } from "@/lib/today";
 import { getReminderSettings, planReminders, reminderCreateOps } from "@/lib/reminder-service";
 import { firstOccurrenceOnOrAfter, type RecurrenceSpec } from "@/lib/recurrence";
 import {
@@ -312,6 +316,7 @@ export async function undoActivity(formData: FormData) {
   revalidatePath("/projects");
   revalidatePath("/review");
   revalidatePath("/board");
+  revalidatePath("/activity");
 }
 
 // ---------------------------------------------------------------------------
@@ -526,4 +531,364 @@ export async function addNote(formData: FormData) {
 
   revalidatePath("/");
   revalidatePath("/projects");
+}
+
+// ---------------------------------------------------------------------------
+// WP9 · today's three answers (R1, R2, R3) and their ledger (R4). Each answer
+// goes through mutate() (invariant 1) and returns the activity id + its summary
+// so the screen can print the one ledger line and offer undo (U) on it. Every
+// answer is reversible; there are no confirmation dialogs (invariant 2).
+//
+// What each answer writes is the whole difference between them (decisions 113):
+//   • Done      — completes the task, reusing the SAME completion path as the
+//                 board's status→done (completedAt + the WP8 recurrence spawn).
+//   • Not today — moves the do date only, never the due date (invariant 6).
+//   • Waiting   — writes a person + a blocker; the expected-by seeds the do date.
+//   • Something else — records an override and moves NO date (decisions 250).
+// ---------------------------------------------------------------------------
+
+export interface TodayAnswer {
+  ok?: boolean;
+  activityId?: string;
+  summary?: string;
+  error?: string;
+  /** For something-else: the override row, so a reason can be attached after. */
+  overrideId?: string;
+}
+
+/**
+ * Done. Completes the task through the same path the board's status→done uses
+ * (src/app/board/actions.ts · editTaskField): it stamps completedAt so habit
+ * history and recency reads work, and it spawns the next recurrence occurrence
+ * in the SAME write (WP8) so a completion never loses the next occurrence. The
+ * whole thing reverses from one ledger line.
+ */
+export async function completeTaskToday(id: string): Promise<TodayAnswer> {
+  await requireUser();
+  const before = await getTask(id);
+  if (!before || before.deletedAt) return { error: "That task is gone." };
+  if (before.status === "done") return { error: "Already done." };
+
+  const spawn = await spawnNextOccurrenceOps(id);
+  const summary = spawn ? `Done: “${before.title}” · ${spawn.summary}` : `Done: “${before.title}”`;
+
+  const { activity } = await mutate({
+    actor: { kind: "user" },
+    verb: "today.done",
+    taskId: id,
+    summary,
+    undo: {
+      ops: [
+        ...(spawn?.undo ?? []),
+        {
+          action: "update",
+          model: "task",
+          id,
+          data: { status: before.status, completedAt: before.completedAt },
+        },
+      ],
+    },
+    apply: async (tx) => {
+      await tx.task.update({ where: { id }, data: { status: "done", completedAt: new Date() } });
+      if (spawn) await spawn.run(tx);
+    },
+  });
+
+  revalidatePath("/");
+  revalidatePath("/board");
+  return { ok: true, activityId: activity.id, summary };
+}
+
+/**
+ * Not today → a date (tomorrow, the named weekday, or a picked day) or "no date".
+ * Moves the do date and nothing else — the due date is untouched (invariant 6),
+ * because a deadline is not rescheduled by deciding not to do it today. The
+ * label is the word the row showed, echoed back into the ledger.
+ */
+export async function notTodayMove(
+  id: string,
+  dateIso: string,
+  label: string
+): Promise<TodayAnswer> {
+  await requireUser();
+  const before = await getTask(id);
+  if (!before || before.deletedAt) return { error: "That task is gone." };
+
+  const doDate = dateIso ? isoToDate(dateIso) : null;
+  const summary = `Not today → ${label} · “${before.title}”`;
+
+  const { activity } = await mutate({
+    actor: { kind: "user" },
+    verb: "today.notToday",
+    taskId: id,
+    filterKind: "dates",
+    summary,
+    undo: {
+      ops: [
+        {
+          action: "update",
+          model: "task",
+          id,
+          data: { doDate: before.doDate, doDateSetBy: before.doDateSetBy },
+        },
+      ],
+    },
+    // The do date is one the user chose for themselves, so it is user-set.
+    apply: (tx) =>
+      tx.task.update({ where: { id }, data: { doDate, doDateSetBy: doDate ? "user" : null } }),
+  });
+
+  revalidatePath("/");
+  revalidatePath("/board");
+  return { ok: true, activityId: activity.id, summary };
+}
+
+/**
+ * Not today → waiting on someone (R3). Names a person (creating an unknown name
+ * in the same keystroke), writes a blocker with the expected-by date, and seeds
+ * the do date from that date — the due date stays put (invariant 6, decisions
+ * 113). The whole thing reverses from one line.
+ *
+ * Deferred to WP15, with the seam noted: suspending the task's reminders while
+ * it is blocked, and the nightly job that flips a passed expected-by to "late".
+ * The schema (blocker.state) already carries what those need.
+ */
+export async function notTodayWaiting(
+  id: string,
+  personName: string,
+  expectedByIso: string
+): Promise<TodayAnswer> {
+  await requireUser();
+  const before = await getTask(id);
+  if (!before || before.deletedAt) return { error: "That task is gone." };
+  const name = personName.trim();
+  if (!name) return { error: "Name the person you are waiting on." };
+
+  const person = await resolvePerson(name);
+  const blockerId = crypto.randomUUID();
+  const expectedBy = expectedByIso ? isoToDate(expectedByIso) : null;
+  const seededDo = expectedBy; // the expected-by seeds the do date (decisions 113)
+  const whenWord = expectedByIso ? `, expected ${shortDate(expectedByIso)}` : "";
+  const summary = `Waiting on ${name}${whenWord} · “${before.title}”`;
+
+  const undoOps: UndoOp[] = [
+    {
+      action: "update",
+      model: "task",
+      id,
+      data: { doDate: before.doDate, doDateSetBy: before.doDateSetBy },
+    },
+    { action: "deleteRow", model: "blocker", id: blockerId },
+  ];
+  if (!person.existing) undoOps.push({ action: "deleteRow", model: "person", id: person.id });
+
+  const { activity } = await mutate({
+    actor: { kind: "user" },
+    verb: "today.waitingOn",
+    taskId: id,
+    filterKind: "people",
+    summary,
+    undo: { ops: undoOps },
+    apply: async (tx) => {
+      if (!person.existing) await tx.person.create({ data: { id: person.id, name } });
+      await tx.blocker.create({
+        data: { id: blockerId, taskId: id, personId: person.id, expectedBy, state: "waiting" },
+      });
+      // The do date is seeded from the other person's forecast, so it is app-set.
+      await tx.task.update({ where: { id }, data: { doDate: seededDo, doDateSetBy: seededDo ? "app" : before.doDateSetBy } });
+    },
+  });
+
+  revalidatePath("/");
+  revalidatePath("/board");
+  return { ok: true, activityId: activity.id, summary };
+}
+
+/**
+ * When a task already carries a blocker, not-today edits the one field that
+ * moved: the expected-by date (R3). Editing it re-seeds the do date and leaves
+ * the due date alone (decisions 115).
+ */
+export async function editBlockerExpectedBy(
+  taskId: string,
+  blockerId: string,
+  expectedByIso: string
+): Promise<TodayAnswer> {
+  await requireUser();
+  const [task, blocker] = await Promise.all([getTask(taskId), getBlocker(blockerId)]);
+  if (!task || task.deletedAt) return { error: "That task is gone." };
+  if (!blocker || blocker.taskId !== taskId) return { error: "No such blocker." };
+
+  const expectedBy = expectedByIso ? isoToDate(expectedByIso) : null;
+  const whenWord = expectedByIso ? shortDate(expectedByIso) : "no date";
+  const summary = `Expected-by → ${whenWord} · “${task.title}”`;
+
+  const { activity } = await mutate({
+    actor: { kind: "user" },
+    verb: "today.expectedBy",
+    taskId,
+    filterKind: "dates",
+    summary,
+    undo: {
+      ops: [
+        { action: "update", model: "blocker", id: blockerId, data: { expectedBy: blocker.expectedBy } },
+        {
+          action: "update",
+          model: "task",
+          id: taskId,
+          data: { doDate: task.doDate, doDateSetBy: task.doDateSetBy },
+        },
+      ],
+    },
+    apply: async (tx) => {
+      await tx.blocker.update({ where: { id: blockerId }, data: { expectedBy } });
+      await tx.task.update({
+        where: { id: taskId },
+        data: { doDate: expectedBy, doDateSetBy: expectedBy ? "app" : task.doDateSetBy },
+      });
+    },
+  });
+
+  revalidatePath("/");
+  revalidatePath("/board");
+  return { ok: true, activityId: activity.id, summary };
+}
+
+/**
+ * Take the blocker off (R3: the single word "remove blocker"). It clears the
+ * blocker — soft, reversible (invariant 2) — and returns the task to your own
+ * work. The seeded do date is left as it stands; it is the plan now, and a
+ * separate owner.
+ */
+export async function removeBlocker(taskId: string, blockerId: string): Promise<TodayAnswer> {
+  await requireUser();
+  const [task, blocker] = await Promise.all([getTask(taskId), getBlocker(blockerId)]);
+  if (!task || task.deletedAt) return { error: "That task is gone." };
+  if (!blocker || blocker.taskId !== taskId || blocker.state === "cleared") {
+    return { error: "No blocker to remove." };
+  }
+
+  const summary = `Blocker removed · “${task.title}”`;
+  const { activity } = await mutate({
+    actor: { kind: "user" },
+    verb: "today.removeBlocker",
+    taskId,
+    filterKind: "people",
+    summary,
+    undo: {
+      ops: [
+        {
+          action: "update",
+          model: "blocker",
+          id: blockerId,
+          data: { state: blocker.state, clearedAt: blocker.clearedAt },
+        },
+      ],
+    },
+    apply: (tx) =>
+      tx.blocker.update({ where: { id: blockerId }, data: { state: "cleared", clearedAt: new Date() } }),
+  });
+
+  revalidatePath("/");
+  revalidatePath("/board");
+  return { ok: true, activityId: activity.id, summary };
+}
+
+/**
+ * Something else (R1/R2). Records the override — the task rejected, the task
+ * chosen — and moves no date at all (decisions 250). The rejected task keeps its
+ * estimate, its hours and its place on today. The reason is asked after the pick
+ * and is optional (setOverrideReason); here the override is created with a null
+ * reason, exactly the hand-test case "pick, then give no reason".
+ */
+export async function chooseSomethingElse(
+  rejectedId: string,
+  chosenId: string
+): Promise<TodayAnswer> {
+  await requireUser();
+  if (rejectedId === chosenId) return { error: "That is the same task." };
+  const [rejected, chosen] = await Promise.all([getTask(rejectedId), getTask(chosenId)]);
+  if (!rejected || rejected.deletedAt) return { error: "The rejected task is gone." };
+  if (!chosen || chosen.deletedAt) return { error: "That task is gone." };
+
+  const overrideId = crypto.randomUUID();
+  const summary = `Something else: chose “${chosen.title}” over “${rejected.title}”`;
+
+  const { activity } = await mutate({
+    actor: { kind: "user" },
+    verb: "today.somethingElse",
+    taskId: chosenId,
+    filterKind: "overrides",
+    summary,
+    undo: { ops: [{ action: "deleteRow", model: "override", id: overrideId }] },
+    apply: (tx) =>
+      tx.override.create({
+        data: {
+          id: overrideId,
+          rejectedTaskId: rejectedId,
+          chosenTaskId: chosenId,
+          // No reason yet; the record concerns both tasks until one is given.
+          pointsAt: "both",
+        },
+      }),
+  });
+
+  revalidatePath("/");
+  return { ok: true, activityId: activity.id, summary, overrideId };
+}
+
+/**
+ * Attach a reason to an override after the pick (R1). The four canned reasons
+ * map onto a field the app understands and point at their side; the fifth is
+ * free text, filed against both. Nothing in v1 parses the free text — it is read
+ * on the activity page's overrides filter (R10, decisions 284).
+ */
+export async function setOverrideReason(
+  overrideId: string,
+  code: OverrideReasonCode,
+  freeText?: string
+): Promise<TodayAnswer> {
+  await requireUser();
+  const option = overrideReason(code);
+  if (!option) return { error: "Not a reason." };
+  const text = (freeText ?? "").trim();
+  if (option.freeText && !text) return { error: "Write the line, or leave it." };
+
+  // The override row is read via a query so app code never imports Prisma.
+  const before = await getOverride(overrideId);
+  if (!before) return { error: "No such override." };
+
+  const reasonText = option.freeText ? text : null;
+  const shown = option.freeText ? `“${text}”` : option.human;
+  const summary = `Reason: ${shown}`;
+
+  const { activity } = await mutate({
+    actor: { kind: "user" },
+    verb: "today.overrideReason",
+    taskId: before.chosenTaskId,
+    filterKind: "overrides",
+    summary,
+    undo: {
+      ops: [
+        {
+          action: "update",
+          model: "override",
+          id: overrideId,
+          data: {
+            reasonCode: before.reasonCode,
+            reasonText: before.reasonText,
+            pointsAt: before.pointsAt,
+          },
+        },
+      ],
+    },
+    apply: (tx) =>
+      tx.override.update({
+        where: { id: overrideId },
+        data: { reasonCode: code, reasonText, pointsAt: option.pointsAt },
+      }),
+  });
+
+  revalidatePath("/");
+  return { ok: true, activityId: activity.id, summary };
 }

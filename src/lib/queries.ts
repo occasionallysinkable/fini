@@ -6,6 +6,8 @@ import { collectProjectSubtree } from "./projects";
 import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
 import type { TaskPageData } from "./task-page";
 import { reminderLabel, formatFireTime } from "./reminders";
+import { selectToday, humanDate, shortDate, type TodayTask } from "./today";
+import { groupByDay, type ActivityLine, type FilterKind } from "./activity";
 import { getHabitHistory } from "./recurrence-service";
 import {
   KEEP_VERB,
@@ -666,4 +668,216 @@ export async function resolvePerson(name: string): Promise<{ id: string; existin
   });
   if (found) return { id: found.id, existing: true };
   return { id: crypto.randomUUID(), existing: false };
+}
+
+// ---------------------------------------------------------------------------
+// WP9 · the plain today (R21) and the activity page (R9/R10). Reads only; the
+// ordering, the flat line, the filters and the grouping are the pure functions
+// in @/lib/today and @/lib/activity, called here so the routes get a plain,
+// serialisable payload.
+// ---------------------------------------------------------------------------
+
+async function getUserTimezone(): Promise<string> {
+  const user = await prisma.user.findFirst({ select: { timezone: true } });
+  return user?.timezone ?? "UTC";
+}
+
+/** One task as the today screen sees it: the pure TodayTask fields, plus the
+ *  blocker id and expected-by that the not-today "already blocked" branch edits
+ *  (R3), and the reason it carries for the ledger. */
+export interface TodayItem extends TodayTask {
+  blockerId: string | null;
+  expectedBy: string | null; // YYYY-MM-DD
+}
+
+/** A task the something-else search can pull forward off the board (R2). */
+export interface TodaySearchItem {
+  id: string;
+  title: string;
+  projectName: string | null;
+}
+
+export interface TodayData {
+  today: string; // YYYY-MM-DD in the user's zone
+  tasks: TodayItem[]; // the today set, ordered (R21)
+  searchable: TodaySearchItem[]; // every active task, for the N search field
+  ledger: { activityId: string; summary: string } | null;
+}
+
+/** Build the blocker line for a demoted task (R3): "waiting on Ravi, expected
+ *  4 Aug", or the event text when there is no person, or a plain "waiting on
+ *  someone" when neither is recorded. */
+function blockerLabel(
+  personName: string | null,
+  eventText: string | null,
+  expectedByIso: string | null,
+  late: boolean
+): string {
+  const who = personName ?? eventText ?? "someone";
+  const parts = [`waiting on ${who}`];
+  if (expectedByIso) parts.push(`expected ${shortDate(expectedByIso)}`);
+  if (late) parts.push("late");
+  return parts.join(", ");
+}
+
+export async function getTodayData(): Promise<TodayData> {
+  const today = await todayForUser();
+
+  // Reuse the availability-filtered set (invariant 4 — one isAvailable, views
+  // call it) rather than re-deriving which tasks are live.
+  const available = await getAvailableTasks();
+  const ids = available.map((t) => t.id);
+
+  // The unresolved blocker per task, most recent first, with its person's name.
+  // A waiting/late blocker demotes the task and gives it the "waiting on…" line.
+  const blockers =
+    ids.length > 0
+      ? await prisma.blocker.findMany({
+          where: { taskId: { in: ids }, state: { in: ["waiting", "late"] } },
+          include: { person: { select: { name: true } } },
+          orderBy: { createdAt: "desc" },
+        })
+      : [];
+  const blockerByTask = new Map<string, (typeof blockers)[number]>();
+  for (const b of blockers) if (!blockerByTask.has(b.taskId)) blockerByTask.set(b.taskId, b);
+
+  const items: TodayItem[] = available.map((t) => {
+    const b = blockerByTask.get(t.id);
+    const expectedBy = b?.expectedBy ? ymd(b.expectedBy) : null;
+    return {
+      id: t.id,
+      title: t.title,
+      projectName: t.project?.name ?? null,
+      dueDate: ymd(t.dueDate),
+      dueTime: t.dueTime,
+      doDate: ymd(t.doDate),
+      blocked: b != null,
+      blockerLabel: b
+        ? blockerLabel(b.person?.name ?? null, b.eventText, expectedBy, b.state === "late")
+        : null,
+      blockerId: b?.id ?? null,
+      expectedBy,
+    };
+  });
+
+  const tasks = selectToday(items, today);
+
+  const searchableRows = await prisma.task.findMany({
+    where: { deletedAt: null, status: "active" },
+    select: { id: true, title: true, project: { select: { name: true } } },
+    orderBy: { title: "asc" },
+  });
+  const searchable: TodaySearchItem[] = searchableRows.map((t) => ({
+    id: t.id,
+    title: t.title,
+    projectName: t.project?.name ?? null,
+  }));
+
+  // The ledger seed (R4): the most recent of today's own answers that is still
+  // inside its undo window. It holds until the next answer replaces it; the
+  // client owns it from there. Older answers live on the activity page.
+  const last = await prisma.activity.findFirst({
+    where: { verb: { startsWith: "today." }, undoExpiresAt: { not: null } },
+    orderBy: { at: "desc" },
+    select: { id: true, summary: true, undoExpiresAt: true },
+  });
+  const ledger =
+    last && last.undoExpiresAt && last.undoExpiresAt.getTime() > Date.now()
+      ? { activityId: last.id, summary: last.summary }
+      : null;
+
+  return { today, tasks, searchable, ledger };
+}
+
+/** A blocker on a task, for the not-today branch's undo and re-seed. */
+export function getBlocker(id: string) {
+  return prisma.blocker.findUnique({ where: { id } });
+}
+
+/** An override row, for attaching a reason after the pick (its prior reason
+ *  fields are the undo). */
+export function getOverride(id: string) {
+  return prisma.override.findUnique({ where: { id } });
+}
+
+// ---------------------------------------------------------------------------
+// The activity stream (R9/R10). Reverse chronological, filterable by kind, and
+// paginated — more loads as you scroll. Each row is formatted in the user's zone
+// here (server side) so the client renders plain strings and the grouping needs
+// no zone maths of its own.
+// ---------------------------------------------------------------------------
+
+export interface ActivityStreamLine extends ActivityLine {
+  dayIso: string;
+  heading: string;
+}
+
+export interface ActivityStreamPage {
+  lines: ActivityStreamLine[];
+  nextCursor: string | null;
+}
+
+/** Format a UTC instant into the user's-zone {time, dayIso} pair. */
+function formatInZone(at: Date, timeZone: string): { time: string; dayIso: string } {
+  const time = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(at);
+  const dayIso = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(at);
+  return { time, dayIso };
+}
+
+const ACTIVITY_PAGE_SIZE = 40;
+
+export async function getActivityStream(
+  kind: FilterKind | null,
+  cursorId: string | null = null
+): Promise<ActivityStreamPage> {
+  const timeZone = await getUserTimezone();
+  const rows = await prisma.activity.findMany({
+    where: kind ? { filterKind: kind } : {},
+    orderBy: [{ at: "desc" }, { id: "desc" }],
+    take: ACTIVITY_PAGE_SIZE + 1, // one extra tells us whether more remains
+    ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+    include: { actorPerson: { select: { name: true } } },
+  });
+
+  const hasMore = rows.length > ACTIVITY_PAGE_SIZE;
+  const page = hasMore ? rows.slice(0, ACTIVITY_PAGE_SIZE) : rows;
+  const now = Date.now();
+
+  const lines: ActivityStreamLine[] = page.map((a) => {
+    const { time, dayIso } = formatInZone(a.at, timeZone);
+    const who =
+      a.actor === "user" ? "You" : a.actor === "app" ? "App" : a.actorPerson?.name ?? "Someone";
+    return {
+      id: a.id,
+      at: a.at.toISOString(),
+      time,
+      who,
+      summary: a.summary,
+      undoable: !!a.undoExpiresAt && a.undoExpiresAt.getTime() > now,
+      isDeletion: a.filterKind === "deletions",
+      dayIso,
+      heading: humanDate(dayIso),
+    };
+  });
+
+  return { lines, nextCursor: hasMore ? page[page.length - 1].id : null };
+}
+
+/** The first page of the activity stream, grouped by day, for the initial
+ *  server render. The client takes over paging from `nextCursor`. */
+export async function getActivityFirstPage(
+  kind: FilterKind | null
+): Promise<{ days: ReturnType<typeof groupByDay>; nextCursor: string | null; lines: ActivityStreamLine[] }> {
+  const page = await getActivityStream(kind, null);
+  return { days: groupByDay(page.lines), nextCursor: page.nextCursor, lines: page.lines };
 }
