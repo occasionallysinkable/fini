@@ -16,8 +16,13 @@ import {
   readWakingHours,
   everyWeekday,
   weekdaysLabel,
+  shiftDayIntervals,
+  blockShiftOverlapMinutes,
+  chargeBlockAcrossShifts,
   type RoutableShift,
   type RoutableTask,
+  type ChargeableShift,
+  type BlockInterval,
 } from "./shifts";
 
 const EVERY = everyWeekday();
@@ -236,5 +241,186 @@ describe("weekdaysLabel", () => {
     expect(weekdaysLabel(MON_FRI)).toBe("Mon–Fri");
     expect(weekdaysLabel([true, false, false, true, false, false, false])).toBe("Sun, Wed");
     expect(weekdaysLabel([false, false, false, false, false, false, false])).toBe("no days");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP14 · block overlap charging — the arithmetic the calendar exists to get
+// right. Times are minutes past midnight (9:00 = 540). The five named cases come
+// straight from blocks-across-shifts.md; charging by overlap, never by where the
+// block started, is the whole point.
+// ---------------------------------------------------------------------------
+
+const H = (h: number, m = 0) => h * 60 + m;
+
+describe("shiftDayIntervals", () => {
+  it("an ordinary window is one interval", () => {
+    expect(shiftDayIntervals(H(9), H(17))).toEqual([[540, 1020]]);
+  });
+  it("start === end is the whole day", () => {
+    expect(shiftDayIntervals(0, 0)).toEqual([[0, 1440]]);
+    expect(shiftDayIntervals(H(8), H(8))).toEqual([[0, 1440]]);
+  });
+  it("a midnight-crossing window is two pieces", () => {
+    expect(shiftDayIntervals(H(23), H(3))).toEqual([
+      [1380, 1440],
+      [0, 180],
+    ]);
+  });
+});
+
+describe("blockShiftOverlapMinutes", () => {
+  it("a block wholly inside one shift is charged its whole length", () => {
+    // Morning 9–12, block 10:00–11:00 → the whole 60 minutes are the shift's.
+    expect(blockShiftOverlapMinutes({ startMinutes: H(10), endMinutes: H(11) }, { startMinutes: H(9), endMinutes: H(12) })).toBe(60);
+  });
+  it("a block entirely outside a shift is charged nothing", () => {
+    expect(blockShiftOverlapMinutes({ startMinutes: H(13), endMinutes: H(14) }, { startMinutes: H(9), endMinutes: H(12) })).toBe(0);
+  });
+  it("a whole-day shift absorbs the whole block", () => {
+    expect(blockShiftOverlapMinutes({ startMinutes: H(10), endMinutes: H(12) }, { startMinutes: 0, endMinutes: 0 })).toBe(120);
+  });
+  it("a midnight-crossing shift covers both its late-night and early-morning pieces", () => {
+    // Shift 23:00–03:00. A block in the late piece (23:15–23:45) → 30m.
+    expect(blockShiftOverlapMinutes({ startMinutes: H(23, 15), endMinutes: H(23, 45) }, { startMinutes: H(23), endMinutes: H(3) })).toBe(30);
+    // A block in the early piece (01:00–02:00) → 60m.
+    expect(blockShiftOverlapMinutes({ startMinutes: H(1), endMinutes: H(2) }, { startMinutes: H(23), endMinutes: H(3) })).toBe(60);
+  });
+});
+
+describe("chargeBlockAcrossShifts — the five cases (blocks-across-shifts.md)", () => {
+  const morning = (over: Partial<ChargeableShift> = {}): ChargeableShift => ({
+    id: "morning",
+    name: "Morning",
+    startMinutes: H(9),
+    endMinutes: H(12),
+    admittedCategoryIds: ["work"],
+    capacityMinutes: 180,
+    priorLoadMinutes: 0,
+    ...over,
+  });
+
+  it("case one · crosses into the next accepting shift, 30m each", () => {
+    const afternoon: ChargeableShift = {
+      id: "afternoon", name: "Afternoon", startMinutes: H(12), endMinutes: H(17),
+      admittedCategoryIds: ["work"], capacityMinutes: 300, priorLoadMinutes: 0,
+    };
+    const block: BlockInterval = { startMinutes: H(11, 30), endMinutes: H(12, 30) };
+    const r = chargeBlockAcrossShifts(block, [morning(), afternoon], "work");
+    expect(r.charges.map((c) => [c.shiftId, c.overlapMinutes])).toEqual([
+      ["morning", 30],
+      ["afternoon", 30],
+    ]);
+    expect(r.uncoveredMinutes).toBe(0);
+    expect(r.startedInShiftId).toBe("morning");
+    expect(r.extendsBeyondStartShift).toBe(true);
+    expect(r.overCapacityShiftIds).toEqual([]);
+    expect(r.charges.every((c) => c.admitsTask)).toBe(true);
+  });
+
+  it("case two · crosses a gap where no shift runs → middle hour uncovered", () => {
+    const afternoon: ChargeableShift = {
+      id: "afternoon", name: "Afternoon", startMinutes: H(13), endMinutes: H(17),
+      admittedCategoryIds: ["work"], capacityMinutes: 240, priorLoadMinutes: 0,
+    };
+    const block: BlockInterval = { startMinutes: H(11, 30), endMinutes: H(13, 30) };
+    const r = chargeBlockAcrossShifts(block, [morning(), afternoon], "work");
+    expect(r.charges.map((c) => [c.shiftId, c.overlapMinutes])).toEqual([
+      ["morning", 30],
+      ["afternoon", 30],
+    ]);
+    expect(r.uncoveredMinutes).toBe(60); // the lunch hour belongs to no shift
+    expect(r.overCapacityShiftIds).toEqual([]);
+  });
+
+  it("case three · crosses into a shift that does not accept the task", () => {
+    const deep: ChargeableShift = {
+      id: "deep", name: "Deep Work", startMinutes: H(9), endMinutes: H(12),
+      admittedCategoryIds: ["work"], capacityMinutes: 180, priorLoadMinutes: 0,
+    };
+    const calls: ChargeableShift = {
+      id: "calls", name: "Calls", startMinutes: H(12), endMinutes: H(14),
+      admittedCategoryIds: ["calls"], capacityMinutes: 120, priorLoadMinutes: 0,
+    };
+    const block: BlockInterval = { startMinutes: H(11), endMinutes: H(13) }; // project work
+    const r = chargeBlockAcrossShifts(block, [deep, calls], "work");
+    expect(r.charges.map((c) => [c.shiftId, c.overlapMinutes, c.admitsTask])).toEqual([
+      ["deep", 60, true],
+      ["calls", 60, false], // charged anyway; the tablet names the disagreement
+    ]);
+    expect(r.uncoveredMinutes).toBe(0);
+  });
+
+  it("case four · runs off the end of the last shift → overhang uncovered", () => {
+    const evening: ChargeableShift = {
+      id: "evening", name: "Evening", startMinutes: H(19), endMinutes: H(21),
+      admittedCategoryIds: [], capacityMinutes: 120, priorLoadMinutes: 0,
+    };
+    const block: BlockInterval = { startMinutes: H(20), endMinutes: H(22) };
+    const r = chargeBlockAcrossShifts(block, [evening], null);
+    expect(r.charges.map((c) => [c.shiftId, c.overlapMinutes])).toEqual([["evening", 60]]);
+    expect(r.uncoveredMinutes).toBe(60); // the hour after the day ends
+    expect(r.overCapacityShiftIds).toEqual([]);
+    expect(r.extendsBeyondStartShift).toBe(true);
+  });
+
+  it("case five · swallows a short shift whole → it fills and goes over", () => {
+    const morn: ChargeableShift = {
+      id: "morning", name: "Morning", startMinutes: H(9), endMinutes: H(11),
+      admittedCategoryIds: ["work"], capacityMinutes: 120, priorLoadMinutes: 0,
+    };
+    const errands: ChargeableShift = {
+      id: "errands", name: "Errands", startMinutes: H(11), endMinutes: H(12),
+      admittedCategoryIds: [], capacityMinutes: 60, priorLoadMinutes: 30, // already holds a 30m errand
+    };
+    const afternoon: ChargeableShift = {
+      id: "afternoon", name: "Afternoon", startMinutes: H(12), endMinutes: H(17),
+      admittedCategoryIds: ["work"], capacityMinutes: 300, priorLoadMinutes: 0,
+    };
+    const block: BlockInterval = { startMinutes: H(10), endMinutes: H(13) }; // 3 hours
+    const r = chargeBlockAcrossShifts(block, [morn, errands, afternoon], "work");
+    expect(r.charges.map((c) => [c.shiftId, c.overlapMinutes])).toEqual([
+      ["morning", 60],
+      ["errands", 60], // its whole hour
+      ["afternoon", 60],
+    ]);
+    const err = r.charges.find((c) => c.shiftId === "errands")!;
+    expect(err.totalMinutes).toBe(90); // 30 prior + 60 block
+    expect(err.overByMinutes).toBe(30); // over its 60-minute capacity
+    expect(r.overCapacityShiftIds).toEqual(["errands"]); // → popup, not tablet
+    expect(r.uncoveredMinutes).toBe(0);
+  });
+
+  it("a block in no shift at all is charged to nobody but still measured", () => {
+    // Saturday-style: no shift covers the drop. Nothing charged, still occupied.
+    const block: BlockInterval = { startMinutes: H(19), endMinutes: H(20) };
+    const r = chargeBlockAcrossShifts(block, [], null);
+    expect(r.charges).toEqual([]);
+    expect(r.uncoveredMinutes).toBe(60);
+    expect(r.startedInShiftId).toBeNull();
+    expect(r.extendsBeyondStartShift).toBe(true);
+    expect(r.overCapacityShiftIds).toEqual([]);
+  });
+
+  it("a block wholly inside one shift does not extend beyond it", () => {
+    const block: BlockInterval = { startMinutes: H(9, 30), endMinutes: H(10, 30) };
+    const r = chargeBlockAcrossShifts(block, [morning()], "work");
+    expect(r.charges).toEqual([
+      { shiftId: "morning", shiftName: "Morning", overlapMinutes: 60, admitsTask: true, totalMinutes: 60, overByMinutes: 0 },
+    ]);
+    expect(r.extendsBeyondStartShift).toBe(false);
+    expect(r.uncoveredMinutes).toBe(0);
+  });
+
+  it("the block-length equals the estimate invariant (5): overlaps + uncovered sum to it", () => {
+    const afternoon: ChargeableShift = {
+      id: "afternoon", name: "Afternoon", startMinutes: H(13), endMinutes: H(17),
+      admittedCategoryIds: ["work"], capacityMinutes: 240, priorLoadMinutes: 0,
+    };
+    const estimate = 120;
+    const block: BlockInterval = { startMinutes: H(11, 30), endMinutes: H(11, 30) + estimate };
+    const r = chargeBlockAcrossShifts(block, [morning(), afternoon], "work");
+    const charged = r.charges.reduce((s, c) => s + c.overlapMinutes, 0);
+    expect(charged + r.uncoveredMinutes).toBe(estimate);
   });
 });
