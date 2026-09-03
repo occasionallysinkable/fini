@@ -71,11 +71,13 @@ export function getDeviceByEndpoint(endpoint: string) {
   return prisma.device.findUnique({ where: { endpoint } });
 }
 
-/** The live reminders on a task — for rescheduling when the due date/time moves,
- *  and for the fields their undo needs. */
+/** The live reminders you SET on a task — for rescheduling when the due date/time
+ *  moves, and for the fields their undo needs. The start reminder is excluded: its
+ *  fire instant is the safe start off due_at_utc, not an offset in the user's zone
+ *  (WP13), so it is recomputed on its own path, never through this reschedule. */
 export function getEnabledReminders(taskId: string) {
   return prisma.reminder.findMany({
-    where: { taskId, enabled: true },
+    where: { taskId, enabled: true, isStartReminder: false },
     select: { id: true, offsetMinutes: true, absoluteAt: true, nextFireAtUtc: true },
   });
 }
@@ -326,8 +328,13 @@ export async function getTaskPageData(id: string): Promise<TaskPageData | null> 
         notes: { orderBy: { createdAt: "desc" } },
         // Only live reminders: removing one disables it (invariant 2 — no
         // destructive delete), so a removed reminder is enabled:false and gone
-        // from the list, and undo re-enables it.
-        reminders: { where: { enabled: true }, orderBy: { createdAt: "asc" } },
+        // from the list, and undo re-enables it. The start reminder sits at the
+        // top of the list (reminders.md · "on a commitment the start reminder
+        // sits at the top of the same list").
+        reminders: {
+          where: { enabled: true },
+          orderBy: [{ isStartReminder: "desc" }, { createdAt: "asc" }],
+        },
       },
     }),
     prisma.user.findFirst({ select: { timezone: true } }),

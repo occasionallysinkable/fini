@@ -27,6 +27,12 @@ import {
   getCommitmentPeople,
 } from "@/lib/clock-service";
 import type { CommitmentPerson } from "@/lib/clock";
+import {
+  startReminderSyncOps,
+  recomputeStartRemindersForPersonOps,
+  applyStartReminderPlan,
+  type StartReminderPlan,
+} from "@/lib/start-reminder-service";
 
 /*
   WP6 · the task page's writes. Every one goes through mutate() (invariant 1)
@@ -91,6 +97,9 @@ export async function editTaskPageField(input: {
   let undoData: Record<string, unknown>;
   let summary: string;
   let filterKind: "dates" | null = null;
+  // The task's estimate after this edit — before.estimateMinutes unless THIS edit
+  // changes it. The start reminder's safe start reads it (WP13).
+  let newEstimate: number | null = before.estimateMinutes;
 
   switch (field) {
     case "title": {
@@ -139,6 +148,7 @@ export async function editTaskPageField(input: {
       if (v != null && (!Number.isFinite(v) || v <= 0)) return getTaskPageData(id);
       data = { estimateMinutes: v };
       undoData = { estimateMinutes: before.estimateMinutes };
+      newEstimate = v;
       summary =
         v == null ? `Cleared the estimate on “${before.title}”` : `Estimate ${v}m on “${before.title}”`;
       break;
@@ -176,6 +186,10 @@ export async function editTaskPageField(input: {
   const reminderApply: UndoOp[] = [];
   const reminderUndo: UndoOp[] = [];
   const clockUndo: UndoOp[] = [];
+  // The task's due instant after this edit — before.dueAtUtc unless a due-date /
+  // due-time edit moves it (below). The start reminder's safe start is this minus
+  // the estimate, so both the date paths and the estimate path recompute it.
+  let newDueAtUtc: Date | null = before.dueAtUtc;
   if (field === "dueDate" || field === "dueTime") {
     const newDue =
       field === "dueDate"
@@ -193,6 +207,9 @@ export async function editTaskPageField(input: {
         priorDueZone: before.dueZone,
       }),
     ]);
+    // The clock always reports the post-edit instant; the start reminder reads it
+    // even when the columns did not change (they always do on a real date edit).
+    newDueAtUtc = clockOps.instant.dueAtUtc;
     // The clock op targets this same task row, so fold its new columns straight
     // into the edit's own `data` (one update), and its restore into the undo.
     if (clockOps.apply.length > 0) {
@@ -211,6 +228,22 @@ export async function editTaskPageField(input: {
     }
   }
 
+  // WP13 · recompute the start reminder whenever the safe start could have moved:
+  // a due-date / due-time edit (moves the due instant) or an estimate edit (moves
+  // the offset). WP12 deliberately skipped an estimate edit for due_at_utc — the
+  // due instant does not depend on the estimate — but the safe start does, so the
+  // start reminder MUST recompute here. A removed start reminder (its tombstone)
+  // is respected inside the planner, so this never re-arms one the user took off.
+  let startPlan: StartReminderPlan | null = null;
+  if (field === "dueDate" || field === "dueTime" || field === "estimate") {
+    startPlan = await startReminderSyncOps({
+      taskId: id,
+      kind: before.kind,
+      dueAtUtc: newDueAtUtc,
+      estimateMinutes: newEstimate,
+    });
+  }
+
   await mutate({
     actor: { kind: "user" },
     verb: `task.page.${field}`,
@@ -218,7 +251,12 @@ export async function editTaskPageField(input: {
     summary,
     filterKind,
     undo: {
-      ops: [{ action: "update", model: "task", id, data: undoData }, ...clockUndo, ...reminderUndo],
+      ops: [
+        { action: "update", model: "task", id, data: undoData },
+        ...clockUndo,
+        ...reminderUndo,
+        ...(startPlan?.undo ?? []),
+      ],
     },
     apply: async (tx) => {
       const updated = await tx.task.update({ where: { id }, data });
@@ -227,6 +265,7 @@ export async function editTaskPageField(input: {
           await tx.reminder.update({ where: { id: op.id }, data: op.data });
         }
       }
+      if (startPlan) await applyStartReminderPlan(tx, startPlan);
       return updated;
     },
   });
@@ -281,9 +320,21 @@ export async function addTaskPerson(input: {
     people: newPeople,
   });
 
+  // WP13 · attaching a zoned asked-by / delegated-to person moves the due instant
+  // (invariant 11), which moves the safe start, so recompute the start reminder in
+  // the same write. A commitment that was captured without one (or before WP13) is
+  // armed here; a removed one stays removed (the planner respects its tombstone).
+  const startPlan = await startReminderSyncOps({
+    taskId: id,
+    kind: task.kind,
+    dueAtUtc: clockOps.instant.dueAtUtc,
+    estimateMinutes: task.estimateMinutes,
+  });
+
   const undoOps: UndoOp[] = [
     { action: "deleteWhere", model: "taskPerson", where: { taskId: id, personId: person.id, role } },
     ...clockOps.undo,
+    ...startPlan.undo,
   ];
   if (!person.existing) {
     undoOps.push({ action: "deleteRow", model: "person", id: person.id });
@@ -312,6 +363,7 @@ export async function addTaskPerson(input: {
           await tx.task.update({ where: { id: op.id }, data: op.data });
         }
       }
+      await applyStartReminderPlan(tx, startPlan);
     },
   });
 
@@ -364,8 +416,13 @@ export async function editPersonZone(input: {
   if (dayStart === undefined || dayEnd === undefined) return getTaskPageData(input.taskId);
 
   // Recompute this person's active commitments with the NEW zone (the DB still
-  // holds the old one here; the substitution computes the post-edit instant).
-  const clock = await recomputeCommitmentsForPersonOps(input.personId, { newZone: timezone });
+  // holds the old one here; the substitution computes the post-edit instant), and
+  // — WP13 — move each of their start reminders with the safe start it depends on,
+  // in the SAME write so the zone edit and every moved deadline reverse together.
+  const [clock, startReminders] = await Promise.all([
+    recomputeCommitmentsForPersonOps(input.personId, { newZone: timezone }),
+    recomputeStartRemindersForPersonOps(input.personId, { newZone: timezone }),
+  ]);
 
   const movedNote =
     clock.count > 0
@@ -388,6 +445,7 @@ export async function editPersonZone(input: {
           data: { timezone: before.timezone, dayStart: before.dayStart, dayEnd: before.dayEnd },
         },
         ...clock.undo,
+        ...startReminders.undo,
       ],
     },
     apply: async (tx) => {
@@ -399,6 +457,24 @@ export async function editPersonZone(input: {
         if (op.action === "update") {
           await tx.task.update({ where: { id: op.id }, data: op.data });
         }
+      }
+      for (const op of startReminders.apply) {
+        if (op.action === "update") {
+          await tx.reminder.update({ where: { id: op.id }, data: op.data });
+        }
+      }
+      for (const c of startReminders.creates) {
+        await tx.reminder.create({
+          data: {
+            id: c.id,
+            taskId: c.taskId,
+            offsetMinutes: c.offsetMinutes,
+            absoluteAt: null,
+            isStartReminder: true,
+            enabled: true,
+            nextFireAtUtc: c.nextFireAtUtc,
+          },
+        });
       }
     },
   });
@@ -517,13 +593,22 @@ export async function removeReminder(input: { id: string; reminderId: string }):
   const reminder = await getReminder(input.reminderId);
   if (!reminder || reminder.taskId !== input.id || !reminder.enabled) return getTaskPageData(input.id);
   const task = await getTask(input.id);
+  const title = task?.title ?? "a task";
+
+  // Removing a reminder you set is silent; removing the START reminder names what
+  // is being given up, because it is the only thing standing between a busy
+  // evening and a missed commitment (reminders.md). The disabled isStartReminder
+  // row it leaves behind is the tombstone that keeps it removed across later edits.
+  const summary = reminder.isStartReminder
+    ? `Removed the start reminder on “${title}” — nothing now warns you before it is due`
+    : `Removed a reminder on “${title}”`;
 
   await mutate({
     actor: { kind: "user" },
     verb: "reminder.remove",
     taskId: input.id,
     filterKind: "reminders",
-    summary: `Removed a reminder on “${task?.title ?? "a task"}”`,
+    summary,
     undo: {
       ops: [
         {

@@ -138,6 +138,37 @@ export function safeStart(
   return new Date(dueAtUtc.getTime() - estimateMinutes * 60_000);
 }
 
+/**
+ * WP13 · the instant a commitment's start reminder fires (R22). It is the latest
+ * safe start — due_at_utc − estimate — computed HERE off due_at_utc, which the
+ * clock already built in the governing person's zone (invariant 11). Deriving it
+ * from due_at_utc, not from the user's zone, is the whole point: a commitment for
+ * someone in Berlin must warn you relative to THEIR 5pm, not yours.
+ *
+ *   - No due date          → null. The start reminder is only armed on a
+ *                            commitment that has a due date; there is no instant.
+ *   - A due date, no estimate → the due instant itself. Without an estimate there
+ *                            is nothing to work backwards through, so the last
+ *                            moment we can honestly warn is the deadline. (The
+ *                            default-estimate setting is on — R27 — so a real
+ *                            commitment almost always has one; this is the honest
+ *                            fallback for the rare one that does not, better than a
+ *                            hole in the guarantee.)
+ *   - A due date + estimate → the safe start.
+ *
+ * Where there is a due date and no due TIME, the due instant is already 00:00 on
+ * the date in the governing zone (commitmentDueInstant), so an untimed commitment
+ * with no estimate lands at 00:00 — exactly reminders.md's rule — with no special
+ * case here.
+ */
+export function startReminderFireAt(
+  dueAtUtc: Date | null,
+  estimateMinutes: number | null
+): Date | null {
+  if (!dueAtUtc) return null;
+  return safeStart(dueAtUtc, estimateMinutes) ?? dueAtUtc;
+}
+
 export interface ChainInput {
   id: string;
   title: string;

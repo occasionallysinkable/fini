@@ -708,6 +708,11 @@ function RemindersSection({
   const [custom, setCustom] = useState(false);
   const [date, setDate] = useState("");
   const [time, setTime] = useState("");
+  // The start reminder is removable, but removing it names what is given up
+  // (reminders.md) — so its "remove" opens an inline warning rather than acting at
+  // once. Not a confirmation dialog (invariant 2 bans those): an inline sentence,
+  // and the removal itself is reversible from the activity page like every write.
+  const [confirmStart, setConfirmStart] = useState<string | null>(null);
 
   const reset = () => {
     setAdding(false);
@@ -737,6 +742,7 @@ function RemindersSection({
     startTransition(async () => {
       const fresh = await removeReminder({ id: data.id, reminderId });
       setData(fresh);
+      setConfirmStart(null);
     });
   };
 
@@ -746,17 +752,48 @@ function RemindersSection({
     <div>
       {data.reminders.map((r) => (
         <Field key={r.id} label={r.label}>
-          <span className="inline-flex items-center gap-2">
+          <span className="inline-flex flex-wrap items-center gap-2">
             <span className="text-muted">
               {r.when ?? (r.isStart ? "computed from the estimate" : "—")}
             </span>
-            {/* The start reminder's own removal warning is WP13; a reminder you set
-                removes silently (reminders.md). */}
-            {!r.isStart && (
+            {/* A reminder you set removes silently. The start reminder names what is
+                given up first (reminders.md · WP13): its remove opens an inline
+                warning, and only "remove anyway" takes it off. */}
+            {!r.isStart ? (
               <button
                 type="button"
                 disabled={pending}
                 onClick={() => remove(r.id)}
+                className="text-xs text-muted hover:text-accent"
+              >
+                remove
+              </button>
+            ) : confirmStart === r.id ? (
+              <span className="inline-flex flex-wrap items-center gap-2">
+                <span className="text-xs text-muted">
+                  This is the only warning before this commitment is due. Remove it and nothing reminds you to start.
+                </span>
+                <button
+                  type="button"
+                  disabled={pending}
+                  onClick={() => remove(r.id)}
+                  className="text-xs text-accent hover:underline"
+                >
+                  remove anyway
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmStart(null)}
+                  className="text-xs text-muted hover:text-text"
+                >
+                  keep
+                </button>
+              </span>
+            ) : (
+              <button
+                type="button"
+                disabled={pending}
+                onClick={() => setConfirmStart(r.id)}
                 className="text-xs text-muted hover:text-accent"
               >
                 remove

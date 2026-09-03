@@ -3,6 +3,7 @@ import { fireDueReminders } from "@/lib/reminder-service";
 import { rollMissedOccurrences } from "@/lib/recurrence-service";
 import { recordWeeklyExportDueIfNeeded } from "@/lib/export-service";
 import { backfillDueInstants } from "@/lib/clock-service";
+import { armExistingStartReminders } from "@/lib/start-reminder-service";
 
 /*
   WP7 · the tick endpoint. A Cloudflare Worker cron trigger posts here every
@@ -36,6 +37,11 @@ export async function POST(req: Request) {
   // (idempotent — only rows with a due date and a null instant). Runs before the
   // reminders so the chain and any instant-dependent read is current this tick.
   const backfill = await backfillDueInstants();
+  // WP13 · arm a start reminder on every existing commitment with a due date that
+  // has none yet (R22 · "existing commitments armed in one pass"). Runs AFTER the
+  // backfill so due_at_utc is filled before the safe start is read, and it is
+  // idempotent — a commitment already carrying one (armed or removed) is skipped.
+  const armed = await armExistingStartReminders();
   // WP8 · collapse any missed recurring occurrences before firing, so a skipped
   // habit's reminder does not fire against a date that has already passed.
   const roll = await rollMissedOccurrences(now);
@@ -49,5 +55,6 @@ export async function POST(req: Request) {
     skipped: roll.skipped,
     exportDue,
     backfilled: backfill.filled,
+    startRemindersArmed: armed.armed,
   });
 }
