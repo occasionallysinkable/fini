@@ -17,6 +17,7 @@ import { collectProjectSubtree } from "./projects";
 import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
 import type { TaskPageData } from "./task-page";
 import { reminderLabel, formatFireTime } from "./reminders";
+import { orderChain, type ChainInput } from "./clock";
 import { selectToday, humanDate, shortDate, type TodayTask } from "./today";
 import { groupByDay, type ActivityLine, type FilterKind } from "./activity";
 import { getHabitHistory } from "./recurrence-service";
@@ -318,7 +319,9 @@ export async function getTaskPageData(id: string): Promise<TaskPageData | null> 
       include: {
         project: { select: { name: true } },
         taskPeople: {
-          include: { person: { select: { id: true, name: true, timezone: true } } },
+          include: {
+            person: { select: { id: true, name: true, timezone: true, dayStart: true, dayEnd: true } },
+          },
         },
         notes: { orderBy: { createdAt: "desc" } },
         // Only live reminders: removing one disables it (invariant 2 — no
@@ -360,6 +363,8 @@ export async function getTaskPageData(id: string): Promise<TaskPageData | null> 
       personId: tp.person.id,
       name: tp.person.name,
       timezone: tp.person.timezone,
+      dayStart: tp.person.dayStart,
+      dayEnd: tp.person.dayEnd,
       role: tp.role,
     })),
     reminders: t.reminders.map((r) => ({
@@ -671,6 +676,23 @@ export async function resolveProjectPath(path: string[]): Promise<
   return out;
 }
 
+/** The timezones of a set of people, by id — for the capture path's invariant-11
+ *  clock (an asked-by person's zone governs the due instant). Read through the
+ *  lib layer so the server action never imports Prisma. */
+export async function getPersonTimezones(ids: string[]): Promise<Map<string, string | null>> {
+  if (ids.length === 0) return new Map();
+  const rows = await prisma.person.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, timezone: true },
+  });
+  return new Map(rows.map((r) => [r.id, r.timezone]));
+}
+
+/** One person, for the task-page zone/working-hours editor's undo payload. */
+export function getPerson(id: string) {
+  return prisma.person.findUnique({ where: { id } });
+}
+
 /** Resolve a person by name, noting whether they need creating. */
 export async function resolvePerson(name: string): Promise<{ id: string; existing: boolean }> {
   const found: { id: string } | null = await prisma.person.findFirst({
@@ -708,11 +730,27 @@ export interface TodaySearchItem {
   projectName: string | null;
 }
 
+/** One row of the chain (Computed table): a today deadline with the last moment
+ *  it can still be started. Read-only — the screen renders it, never edits it. */
+export interface ChainRow {
+  id: string;
+  title: string;
+  /** The latest safe start, formatted in the user's zone — or null when the task
+   *  has no estimate, so the app cannot say when to start, only when it is due. */
+  safeStartLabel: string | null;
+  /** The deadline instant, formatted in the user's zone. Carries the word
+   *  "deadline" beside it on screen (R26 — no colour-only signal). */
+  dueLabel: string;
+}
+
 export interface TodayData {
   today: string; // YYYY-MM-DD in the user's zone
   tasks: TodayItem[]; // the today set, ordered (R21)
   searchable: TodaySearchItem[]; // every active task, for the N search field
   ledger: { activityId: string; summary: string } | null;
+  /** WP12 · the chain: today's deadline-bearing tasks ordered by safe start,
+   *  read-only. Empty when nothing with a deadline is due today. */
+  chain: ChainRow[];
 }
 
 /** Build the blocker line for a demoted task (R3): "waiting on Ravi, expected
@@ -773,6 +811,29 @@ export async function getTodayData(): Promise<TodayData> {
 
   const tasks = selectToday(items, today);
 
+  // WP12 · the chain (Computed, never stored): today's deadline-bearing tasks —
+  // available, not blocked, with a deadline date of today and a computed instant —
+  // ordered by latest safe start. A blocked task cannot be started, so it is not in
+  // the chain; an available one with a due date today but a null instant only
+  // arises for a row the backfill has not reached yet (it fills within a tick).
+  const timeZone = await getUserTimezone();
+  const chainInputs: ChainInput[] = available
+    .filter(
+      (t) => ymd(t.dueDate) === today && t.dueAtUtc != null && !blockerByTask.has(t.id)
+    )
+    .map((t) => ({
+      id: t.id,
+      title: t.title,
+      dueAtUtc: t.dueAtUtc as Date,
+      estimateMinutes: t.estimateMinutes,
+    }));
+  const chain: ChainRow[] = orderChain(chainInputs).map((c) => ({
+    id: c.id,
+    title: c.title,
+    safeStartLabel: c.safeStart ? formatFireTime(c.safeStart, timeZone) : null,
+    dueLabel: formatFireTime(c.dueAtUtc, timeZone),
+  }));
+
   const searchableRows = await prisma.task.findMany({
     where: { deletedAt: null, status: "active" },
     select: { id: true, title: true, project: { select: { name: true } } },
@@ -797,7 +858,7 @@ export async function getTodayData(): Promise<TodayData> {
       ? { activityId: last.id, summary: last.summary }
       : null;
 
-  return { today, tasks, searchable, ledger };
+  return { today, tasks, searchable, ledger, chain };
 }
 
 /** A blocker on a task, for the not-today branch's undo and re-seed. */

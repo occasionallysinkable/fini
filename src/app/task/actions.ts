@@ -10,6 +10,8 @@ import {
   getReminder,
   getEnabledReminders,
   resolvePerson,
+  getPerson,
+  getPersonTimezones,
 } from "@/lib/queries";
 import { clampSidebarWidth, SIDEBAR_WIDTH_KEY, type TaskPageData } from "@/lib/task-page";
 import type { Role } from "@/lib/parse";
@@ -19,6 +21,12 @@ import {
   reminderRescheduleOps,
   type ReschedulableReminder,
 } from "@/lib/reminder-service";
+import {
+  dueInstantUpdateOps,
+  recomputeCommitmentsForPersonOps,
+  getCommitmentPeople,
+} from "@/lib/clock-service";
+import type { CommitmentPerson } from "@/lib/clock";
 
 /*
   WP6 · the task page's writes. Every one goes through mutate() (invariant 1)
@@ -158,19 +166,41 @@ export async function editTaskPageField(input: {
       return getTaskPageData(id);
   }
 
-  // Moving the due date or time reschedules every offset reminder on the task in
-  // the same write, so the change and the reschedule reverse together
-  // (reminders.md: "Every offset reminder moves with it"). Absolute reminders are
-  // left where they are.
+  // Moving the due date or time does two things in the SAME write, so both
+  // reverse together with the edit:
+  //   1. WP12 · recompute due_at_utc through the invariant-11 clock (the deadline
+  //      instant the safe start and the chain read). No screen converts a time
+  //      itself; the recompute rides along here.
+  //   2. WP7 · reschedule every offset reminder — they are offsets from the due
+  //      time, so the deadline moving moves them (absolute reminders stay put).
   const reminderApply: UndoOp[] = [];
   const reminderUndo: UndoOp[] = [];
+  const clockUndo: UndoOp[] = [];
   if (field === "dueDate" || field === "dueTime") {
-    const [reminders, settings] = await Promise.all([getEnabledReminders(id), getReminderSettings()]);
+    const newDue =
+      field === "dueDate"
+        ? { dueDate: value.trim() || null, dueTime: before.dueTime }
+        : { dueDate: dateToIso(before.dueDate), dueTime: value.trim() || null };
+
+    const [reminders, settings, clockOps] = await Promise.all([
+      getEnabledReminders(id),
+      getReminderSettings(),
+      dueInstantUpdateOps({
+        taskId: id,
+        dueDate: newDue.dueDate,
+        dueTime: newDue.dueTime,
+        priorDueAtUtc: before.dueAtUtc,
+        priorDueZone: before.dueZone,
+      }),
+    ]);
+    // The clock op targets this same task row, so fold its new columns straight
+    // into the edit's own `data` (one update), and its restore into the undo.
+    if (clockOps.apply.length > 0) {
+      const op = clockOps.apply[0];
+      if (op.action === "update") Object.assign(data, op.data);
+      clockUndo.push(...clockOps.undo);
+    }
     if (reminders.length > 0) {
-      const newDue =
-        field === "dueDate"
-          ? { dueDate: value.trim() || null, dueTime: before.dueTime }
-          : { dueDate: dateToIso(before.dueDate), dueTime: value.trim() || null };
       const ops = reminderRescheduleOps(
         reminders as ReschedulableReminder[],
         newDue,
@@ -187,7 +217,9 @@ export async function editTaskPageField(input: {
     taskId: id,
     summary,
     filterKind,
-    undo: { ops: [{ action: "update", model: "task", id, data: undoData }, ...reminderUndo] },
+    undo: {
+      ops: [{ action: "update", model: "task", id, data: undoData }, ...clockUndo, ...reminderUndo],
+    },
     apply: async (tx) => {
       const updated = await tx.task.update({ where: { id }, data });
       for (const op of reminderApply) {
@@ -230,8 +262,28 @@ export async function addTaskPerson(input: {
 
   const person = await resolvePerson(name);
 
+  // WP12 · attaching an asked-by / delegated-to person who carries a zone changes
+  // which clock this task's deadline is read in (invariant 11), so recompute the
+  // due instant in the same write. A brand-new person has no zone yet, so this is
+  // a no-op until their zone is filled in (which then recomputes it). The new
+  // people set is the current one plus the pair being added.
+  const addedZone = person.existing
+    ? (await getPersonTimezones([person.id])).get(person.id) ?? null
+    : null;
+  const priorPeople = await getCommitmentPeople(id);
+  const newPeople: CommitmentPerson[] = [...priorPeople, { role, timezone: addedZone }];
+  const clockOps = await dueInstantUpdateOps({
+    taskId: id,
+    dueDate: dateToIso(task.dueDate),
+    dueTime: task.dueTime,
+    priorDueAtUtc: task.dueAtUtc,
+    priorDueZone: task.dueZone,
+    people: newPeople,
+  });
+
   const undoOps: UndoOp[] = [
     { action: "deleteWhere", model: "taskPerson", where: { taskId: id, personId: person.id, role } },
+    ...clockOps.undo,
   ];
   if (!person.existing) {
     undoOps.push({ action: "deleteRow", model: "person", id: person.id });
@@ -255,10 +307,103 @@ export async function addTaskPerson(input: {
       if (!already) {
         await tx.taskPerson.create({ data: { taskId: id, personId: person.id, role } });
       }
+      for (const op of clockOps.apply) {
+        if (op.action === "update") {
+          await tx.task.update({ where: { id: op.id }, data: op.data });
+        }
+      }
     },
   });
 
   return reloadAndRevalidate(id);
+}
+
+/** Is a string a real IANA zone the runtime knows? Intl throws on an unknown
+ *  zone, so a try/catch is the honest check — nothing hard-coded (invariant 12). */
+function isValidZone(zone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * WP12 · edit a person's zone and working hours, from the task page's Who section
+ * (people are reached from the tasks that reference them — R19; there is no people
+ * screen). A person is a record, not a string: their zone is inherited by every
+ * task that involves them (decisions 264). So changing it recomputes the due
+ * instant of every ACTIVE commitment of theirs in the SAME write, and the whole
+ * thing — the person's fields and every moved instant — reverses from one ledger
+ * line. Past (done) commitments keep the instant they were promised at: their
+ * frozen due_zone is the history the invariant preserves.
+ */
+export async function editPersonZone(input: {
+  taskId: string;
+  personId: string;
+  timezone: string; // "" clears it
+  dayStart: string; // "HH:MM" or ""
+  dayEnd: string; // "HH:MM" or ""
+}): Promise<TaskPageData | null> {
+  await requireUser();
+  const before = await getPerson(input.personId);
+  if (!before) return getTaskPageData(input.taskId);
+
+  const tz = input.timezone.trim();
+  if (tz && !isValidZone(tz)) return getTaskPageData(input.taskId); // ignore a bad zone
+  const timezone = tz || null;
+
+  const hhmm = (v: string): string | null | undefined => {
+    const s = v.trim();
+    if (s === "") return null;
+    return /^\d{2}:\d{2}$/.test(s) ? s : undefined; // undefined = invalid, leave as-is
+  };
+  const dayStart = hhmm(input.dayStart);
+  const dayEnd = hhmm(input.dayEnd);
+  if (dayStart === undefined || dayEnd === undefined) return getTaskPageData(input.taskId);
+
+  // Recompute this person's active commitments with the NEW zone (the DB still
+  // holds the old one here; the substitution computes the post-edit instant).
+  const clock = await recomputeCommitmentsForPersonOps(input.personId, { newZone: timezone });
+
+  const movedNote =
+    clock.count > 0
+      ? ` · moved ${clock.count} deadline${clock.count === 1 ? "" : "s"}`
+      : "";
+  const summary = `Set ${before.name}'s zone to ${timezone ?? "none"}${movedNote}`;
+
+  await mutate({
+    actor: { kind: "user" },
+    verb: "person.zone",
+    taskId: input.taskId,
+    filterKind: "people",
+    summary,
+    undo: {
+      ops: [
+        {
+          action: "update",
+          model: "person",
+          id: input.personId,
+          data: { timezone: before.timezone, dayStart: before.dayStart, dayEnd: before.dayEnd },
+        },
+        ...clock.undo,
+      ],
+    },
+    apply: async (tx) => {
+      await tx.person.update({
+        where: { id: input.personId },
+        data: { timezone, dayStart, dayEnd },
+      });
+      for (const op of clock.apply) {
+        if (op.action === "update") {
+          await tx.task.update({ where: { id: op.id }, data: op.data });
+        }
+      }
+    },
+  });
+
+  return reloadAndRevalidate(input.taskId);
 }
 
 /** Add a note to the task (R6: the Notes section). Stands as its own reversible

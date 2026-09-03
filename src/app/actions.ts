@@ -15,8 +15,10 @@ import {
   buildCaptureContext,
   resolveProjectPath,
   resolvePerson,
+  getPersonTimezones,
 } from "@/lib/queries";
 import { parse, inferKind, todayInZone, weekdayOf, type Role, type Kind } from "@/lib/parse";
+import { computeTaskDueInstant, type CommitmentPerson } from "@/lib/clock";
 import { spawnNextOccurrenceOps } from "@/lib/recurrence-service";
 import { shortDate, overrideReason, type OverrideReasonCode } from "@/lib/today";
 import { getReminderSettings, planReminders, reminderCreateOps } from "@/lib/reminder-service";
@@ -199,6 +201,27 @@ export async function captureTask(
   });
   const reminderOps = reminderCreateOps(taskId, plannedReminders);
 
+  // WP12 · the invariant-11 clock. The due instant is computed once here, in the
+  // governing zone — an asked-by (or delegated-to) person's zone when one is set,
+  // the user's own otherwise — and frozen onto due_at_utc / due_zone. No screen
+  // does its own conversion (invariant 11); the safe start and the chain read this
+  // instant. The zone comes from the resolved people: a brand-new person has no
+  // zone yet, so a commitment typed with a fresh name falls back to the user's
+  // clock until that person's zone is filled in (which then recomputes it).
+  const personZones = await getPersonTimezones(
+    resolvedPeople.filter((p) => p.existing).map((p) => p.id)
+  );
+  const commitmentPeople: CommitmentPerson[] = resolvedPeople.map((p) => ({
+    role: p.role,
+    timezone: p.existing ? personZones.get(p.id) ?? null : null,
+  }));
+  const dueInstant = computeTaskDueInstant({
+    dueDate: occDueDate ? occDueDate.toISOString().slice(0, 10) : null,
+    dueTime: p.dueTime,
+    people: commitmentPeople,
+    userZone: reminderSettings.timeZone,
+  });
+
   // Reversal, in FK-safe order: reminders and links, then task, then the rule
   // (the task points at it), then anything this capture newly created (people,
   // then projects leaf→root).
@@ -264,6 +287,8 @@ export async function captureTask(
           doDateSetBy: occDoDateSetBy,
           dueDate: occDueDate,
           dueTime: p.dueTime,
+          dueAtUtc: dueInstant.dueAtUtc,
+          dueZone: dueInstant.dueZone,
           deferUntil: p.deferUntil ? isoToDate(p.deferUntil) : null,
           estimateMinutes: p.estimateGiven ? p.estimateMinutes : null,
           splittable: p.chunking?.splittable ?? false,
