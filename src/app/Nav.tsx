@@ -6,10 +6,9 @@ import { usePathname } from "next/navigation";
 /*
   WP9 · the navigation (R19). A thin left rail of five words — today · calendar ·
   board · activity · settings — no icons on their own, the current one marked.
-  Today and activity are this package's screens and are wired here; board already
-  exists. Calendar (WP14) and settings (WP10+) are not routes yet, so they are
-  present but quiet — the rail names the whole app so its shape is legible, and
-  those two light up when their packages land.
+  Today and activity were this package's screens; board, settings (WP10) and
+  calendar (WP14) are now real routes too, so every word in the rail is wired.
+  An entry with wired:false stays present but quiet until its package lands.
 
   Search is the slash key (WP4, from the board) and planning is a button on today
   (WP18), so neither is a rail entry — they are a mode you enter, not a place you
@@ -18,7 +17,7 @@ import { usePathname } from "next/navigation";
 
 const ENTRIES: { href: string; label: string; wired: boolean }[] = [
   { href: "/", label: "today", wired: true },
-  { href: "/calendar", label: "calendar", wired: false },
+  { href: "/calendar", label: "calendar", wired: true },
   { href: "/board", label: "board", wired: true },
   { href: "/activity", label: "activity", wired: true },
   { href: "/settings", label: "settings", wired: true },

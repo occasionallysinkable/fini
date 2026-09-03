@@ -145,12 +145,22 @@ export interface ShiftLoad {
   remainingMinutes: number | null;
 }
 
-/** The load a routed set of tasks puts on a shift with a given capacity. */
+/**
+ * The load a routed set of tasks puts on a shift with a given capacity, plus —
+ * WP14 — the minutes charged to it by blocks that overlap its window. The
+ * scheduled total is exactly the Computed table: the sum of estimates of untimed
+ * tasks routed to the shift, plus, for every block overlapping its window, the
+ * minutes of overlap (never a proportion). `blockOverlapMinutes` is the already-
+ * summed overlap for THIS shift (chargeBlockAcrossShifts computes it); it
+ * defaults to 0 so a caller with no blocks — and every WP11 caller — is
+ * unchanged.
+ */
 export function shiftLoad(
   routedTasks: RoutableTask[],
-  capacityMinutes: number | null
+  capacityMinutes: number | null,
+  blockOverlapMinutes = 0
 ): ShiftLoad {
-  let scheduledMinutes = 0;
+  let scheduledMinutes = blockOverlapMinutes;
   let unestimatedCount = 0;
   for (const t of routedTasks) {
     if (t.estimateMinutes == null) unestimatedCount += 1;
@@ -161,6 +171,184 @@ export function shiftLoad(
     unestimatedCount,
     capacityMinutes,
     remainingMinutes: capacityMinutes == null ? null : capacityMinutes - scheduledMinutes,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// WP14 · block overlap charging. This is the arithmetic the calendar exists to
+// get right (blocks-across-shifts.md): a block dropped on the hour grid is
+// charged to EVERY shift it overlaps, for the minutes it genuinely occupies
+// inside that shift — never by proportion, never all to the shift it started in.
+// Minutes in no shift are charged to nobody but the block is still drawn. Pure,
+// so the five worked cases are unit-tested without a database.
+// ---------------------------------------------------------------------------
+
+/**
+ * A block on the grid, resolved to minutes past midnight on its do-date. `end`
+ * may exceed 1440 when a block runs past midnight — the part beyond the day is in
+ * no shift (shifts are within a day), so it is naturally charged to nobody, which
+ * is case four's "after your last shift ends" with a different cause. end > start
+ * always, and end − start is the estimate (invariant 5).
+ */
+export interface BlockInterval {
+  startMinutes: number;
+  endMinutes: number;
+}
+
+/**
+ * A shift's covered minutes on a day, as plain non-wrapping [start, end)
+ * intervals within [0, 1440]:
+ *   - start === end  → the whole day (the R29 default), [[0, 1440]].
+ *   - start <  end   → the ordinary window, [[start, end]].
+ *   - start >  end   → crosses midnight, two pieces [[start, 1440], [0, end]].
+ * This mirrors windowMinutes' three cases so the two never disagree.
+ */
+export function shiftDayIntervals(
+  startMinutes: number,
+  endMinutes: number
+): [number, number][] {
+  if (startMinutes === endMinutes) return [[0, WHOLE_DAY_MINUTES]];
+  if (startMinutes < endMinutes) return [[startMinutes, endMinutes]];
+  return [
+    [startMinutes, WHOLE_DAY_MINUTES],
+    [0, endMinutes],
+  ];
+}
+
+/** The overlap of two plain intervals, in minutes (0 if they do not meet). */
+function intervalOverlap(a0: number, a1: number, b0: number, b1: number): number {
+  return Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
+}
+
+/**
+ * Minutes of a block that sit inside one shift's window — the charge that shift
+ * takes. Sums the block's overlap with each piece of the shift's day-coverage, so
+ * a wrap-past-midnight shift is handled correctly. This is the core number the
+ * whole calendar's arithmetic rests on.
+ */
+export function blockShiftOverlapMinutes(
+  block: BlockInterval,
+  shift: { startMinutes: number; endMinutes: number }
+): number {
+  const pieces = shiftDayIntervals(shift.startMinutes, shift.endMinutes);
+  let total = 0;
+  for (const [a, b] of pieces) {
+    total += intervalOverlap(block.startMinutes, block.endMinutes, a, b);
+  }
+  return total;
+}
+
+/** A shift the block might cross, with everything the charge and the tablet need. */
+export interface ChargeableShift {
+  id: string;
+  name: string;
+  startMinutes: number;
+  endMinutes: number;
+  admittedCategoryIds: string[];
+  capacityMinutes: number | null;
+  /** Minutes already charged to this shift on the day from OTHER work — the
+   *  routed untimed tasks and any other blocks. Adding this block's overlap to it
+   *  is what can push the shift over capacity. */
+  priorLoadMinutes: number;
+}
+
+/** What one shift is charged for this block, and whether that put it over. */
+export interface ShiftCharge {
+  shiftId: string;
+  shiftName: string;
+  overlapMinutes: number;
+  /** Does the shift's category rule admit this task? A block is charged even when
+   *  it does not (decisions: the rule guides the app's placing, not your hands),
+   *  and the tablet names the disagreement. */
+  admitsTask: boolean;
+  /** priorLoad + this block's overlap. */
+  totalMinutes: number;
+  /** Minutes over capacity after this block (0 when under, or no capacity set). */
+  overByMinutes: number;
+}
+
+export interface BlockChargeResult {
+  /** One entry per shift the block actually overlaps (overlap > 0). */
+  charges: ShiftCharge[];
+  /** Block minutes inside no shift at all — charged to nobody, still occupied. */
+  uncoveredMinutes: number;
+  /** The shift whose window contains the block's start minute, or null when the
+   *  block starts in a gap / before any shift. Used to read "extends past the
+   *  shift it started in". */
+  startedInShiftId: string | null;
+  /** True when the block occupies time outside the single shift it began in —
+   *  either a second shift, a gap, or the end of the day. Drives the tablet. */
+  extendsBeyondStartShift: boolean;
+  /** Shifts pushed over capacity by this block — these raise the popup, not the
+   *  tablet (going over is a different thing from being worth knowing about). */
+  overCapacityShiftIds: string[];
+}
+
+/**
+ * Charge a block across the day's shifts (blocks-across-shifts.md, the whole
+ * page). Every overlapping shift is charged its overlap; uncovered minutes are
+ * charged to nobody; a shift whose total now exceeds capacity is flagged for the
+ * popup. Pure and total — the five worked cases are its tests.
+ */
+export function chargeBlockAcrossShifts(
+  block: BlockInterval,
+  shifts: ChargeableShift[],
+  taskCategoryId: string | null
+): BlockChargeResult {
+  const charges: ShiftCharge[] = [];
+  let coveredMinutes = 0;
+  let startedInShiftId: string | null = null;
+  const overCapacityShiftIds: string[] = [];
+
+  for (const sh of shifts) {
+    // The shift the block STARTED in: its window contains the start minute. Tested
+    // with a zero-length probe so a block starting exactly on a boundary reads as
+    // beginning in the earlier shift's [start, end) rather than the next one.
+    if (
+      startedInShiftId == null &&
+      blockShiftOverlapMinutes(
+        { startMinutes: block.startMinutes, endMinutes: block.startMinutes + 1 },
+        sh
+      ) > 0
+    ) {
+      startedInShiftId = sh.id;
+    }
+
+    const overlap = blockShiftOverlapMinutes(block, sh);
+    if (overlap <= 0) continue;
+    coveredMinutes += overlap;
+
+    const total = sh.priorLoadMinutes + overlap;
+    const overBy =
+      sh.capacityMinutes == null ? 0 : Math.max(0, total - sh.capacityMinutes);
+    if (overBy > 0) overCapacityShiftIds.push(sh.id);
+
+    charges.push({
+      shiftId: sh.id,
+      shiftName: sh.name,
+      overlapMinutes: overlap,
+      admitsTask: shiftAdmitsCategory(sh.admittedCategoryIds, taskCategoryId),
+      totalMinutes: total,
+      overByMinutes: overBy,
+    });
+  }
+
+  const blockLength = block.endMinutes - block.startMinutes;
+  // Uncovered = the block's length minus everything a shift absorbed. Shifts in
+  // this app do not overlap each other, so summed overlaps never exceed the block.
+  const uncoveredMinutes = Math.max(0, blockLength - coveredMinutes);
+
+  return {
+    charges,
+    uncoveredMinutes,
+    startedInShiftId,
+    // It extends beyond its start shift when any time is charged elsewhere or is
+    // uncovered — i.e. the block is not wholly inside the one shift it began in.
+    extendsBeyondStartShift:
+      uncoveredMinutes > 0 ||
+      charges.filter((c) => c.overlapMinutes > 0).some((c) => c.shiftId !== startedInShiftId) ||
+      (startedInShiftId == null && charges.length === 0 && blockLength > 0),
+    overCapacityShiftIds,
   };
 }
 

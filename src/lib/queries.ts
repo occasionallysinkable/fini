@@ -15,9 +15,23 @@ import { isAvailable } from "./availability";
 import { isReviewDue } from "./review";
 import { collectProjectSubtree } from "./projects";
 import type { BoardTask, ColumnId, GroupKey, Sort } from "./board";
-import type { TaskPageData } from "./task-page";
+import { fmtMinutes, type TaskPageData } from "./task-page";
 import { reminderLabel, formatFireTime } from "./reminders";
-import { orderChain, type ChainInput } from "./clock";
+import { orderChain, safeStart, type ChainInput } from "./clock";
+import {
+  calendarDays,
+  blockGridInterval,
+  blockTimeLabel,
+  instantToWallMinutes,
+  type CalendarDay,
+} from "./calendar";
+import {
+  chargeBlockAcrossShifts,
+  remainingLabel,
+  unestimatedLabel,
+  type ChargeableShift,
+  type BlockInterval,
+} from "./shifts";
 import { selectToday, humanDate, shortDate, type TodayTask } from "./today";
 import { groupByDay, type ActivityLine, type FilterKind } from "./activity";
 import { getHabitHistory } from "./recurrence-service";
@@ -722,6 +736,13 @@ async function getUserTimezone(): Promise<string> {
   return user?.timezone ?? "UTC";
 }
 
+/** The user's IANA zone, for a write action that needs it (invariant 10 — a
+ *  block's wall time is expressed in the user's own zone). Exported so the
+ *  calendar actions read it through the lib layer, never Prisma directly. */
+export async function getUserZone(): Promise<string> {
+  return getUserTimezone();
+}
+
 /** One task as the today screen sees it: the pure TodayTask fields, plus the
  *  blocker id and expected-by that the not-today "already blocked" branch edits
  *  (R3), and the reason it carries for the ledger. */
@@ -1111,4 +1132,504 @@ export function getUserForShiftWrite() {
   return prisma.user.findFirst({
     select: { id: true, settings: true, wakingStart: true, wakingEnd: true },
   });
+}
+
+// ---------------------------------------------------------------------------
+// WP14 · the calendar (R8, and the whole calendar section of decisions). Reads
+// the visible days, the shift bands on each, the all-day work and the placed
+// blocks, and the undated rail — everything the screen renders in one round.
+// The block-overlap charge (blocks-across-shifts.md) is computed here from the
+// pure functions in @/lib/shifts and @/lib/calendar so each shift's remaining
+// figure includes the blocks that cross it (Computed table; invariant 3).
+// ---------------------------------------------------------------------------
+
+/** A shift band drawn across a day (R8): the window, and the remaining time it
+ *  has after everything charged to it that day (routed untimed tasks + blocks). */
+export interface CalendarBand {
+  id: string;
+  name: string;
+  startMinutes: number;
+  endMinutes: number;
+  /** True for a whole-day (00:00–00:00) or midnight-crossing window; the band is
+   *  drawn to the edge of the grid rather than as a bounded stripe. */
+  wholeDay: boolean;
+  remainingLabel: string;
+  unestimatedLabel: string | null;
+}
+
+/** A block on the hour grid. A deadline-bearing task's block carries the word
+ *  "deadline" and refuses the drag (R8/R26); everything else moves freely. */
+export interface CalendarBlock {
+  id: string; // task id
+  title: string;
+  projectName: string | null;
+  startMinutes: number;
+  endMinutes: number;
+  timeLabel: string;
+  estimateMinutes: number | null;
+  /** Deadline-bearing (in the chain) → magenta edge + the word "deadline",
+   *  read-only. The promise is moved on the task, never dragged on the grid. */
+  deadline: boolean;
+  /** A placed block (block_start set, charges its shifts) vs a chain marker drawn
+   *  from a deadline's safe start to its due instant (read-only, charges nothing —
+   *  it marks the commitment the capacity is protecting). */
+  placed: boolean;
+}
+
+/** A task in the all-day strip (R8): do-dated to the day, no block. */
+export interface CalendarAllDayItem {
+  id: string;
+  title: string;
+  projectName: string | null;
+  deadline: boolean;
+}
+
+export interface CalendarDayView {
+  day: CalendarDay;
+  /** Active shifts on this weekday, as bands. Empty → the column reads "no
+   *  shifts" and is unshifted paper (a drop there still works — R8/decisions). */
+  bands: CalendarBand[];
+  allDay: CalendarAllDayItem[];
+  blocks: CalendarBlock[];
+  /** "5h 10m · 2 shifts", or "no shifts". What the day now holds (R8). */
+  header: string;
+}
+
+/** An undated task in the left rail (R8): ranked, searchable, draggable. */
+export interface CalendarRailItem {
+  id: string;
+  title: string;
+  projectName: string | null;
+  estimateMinutes: number | null;
+  estimateLabel: string;
+  deadline: boolean;
+}
+
+export interface CalendarData {
+  today: string;
+  dayCount: number;
+  timezone: string;
+  days: CalendarDayView[];
+  rail: CalendarRailItem[];
+  /** The grid's vertical bounds, shared across every column so hours line up. */
+  gridStartMinutes: number;
+  gridEndMinutes: number;
+}
+
+/** A date-only "YYYY-MM-DD" as the midnight-UTC value @db.Date stores. */
+function isoToDbDate(iso: string): Date {
+  return new Date(`${iso}T00:00:00.000Z`);
+}
+
+export async function getCalendarData(dayCountRaw: number): Promise<CalendarData> {
+  const timezone = await getUserTimezone();
+  const today = todayInZone(timezone);
+  const days = calendarDays(today, dayCountRaw);
+  const dayCount = days.length;
+  const firstIso = days[0].iso;
+  const lastIso = days[days.length - 1].iso;
+
+  const [shifts, blockTasks, allDayTasks, railSource] = await Promise.all([
+    prisma.shift.findMany({
+      orderBy: [{ startTime: "asc" }, { createdAt: "asc" }],
+      include: { shiftCategories: { select: { categoryId: true } } },
+    }),
+    // Placed blocks in the visible range: active, do-dated within range, with a
+    // block. (do_date is written alongside every block, so it is the reliable key.)
+    prisma.task.findMany({
+      where: {
+        deletedAt: null,
+        status: "active",
+        blockStart: { not: null },
+        doDate: { gte: isoToDbDate(firstIso), lte: isoToDbDate(lastIso) },
+      },
+      include: { project: { select: { name: true } } },
+    }),
+    // All-day work: active, do-dated within range, with no block.
+    prisma.task.findMany({
+      where: {
+        deletedAt: null,
+        status: "active",
+        blockStart: null,
+        doDate: { gte: isoToDbDate(firstIso), lte: isoToDbDate(lastIso) },
+      },
+      include: { project: { select: { name: true } } },
+    }),
+    // The rail: available, undated, unplaced, and NOT deadline-bearing — a
+    // deadline lives on the grid (the chain), not the rail. Ranked by the stage-1
+    // order (position, then createdAt); WP17 swaps in the score.
+    getAvailableTasks(),
+  ]);
+
+  // Deadline-bearing tasks due within the range but not yet placed — drawn as
+  // read-only chain markers on their due day (magenta + "deadline"). They mark
+  // the commitment the shift capacity is protecting; they charge nothing (only a
+  // placed block charges), so the day's arithmetic stays exactly blocks-across-
+  // shifts.md.
+  const chainTasks = await prisma.task.findMany({
+    where: {
+      deletedAt: null,
+      status: "active",
+      blockStart: null,
+      dueAtUtc: { not: null },
+      dueDate: { gte: isoToDbDate(firstIso), lte: isoToDbDate(lastIso) },
+    },
+    include: { project: { select: { name: true } } },
+  });
+
+  // Group placed blocks and all-day items by their do-date iso.
+  const blocksByDay = new Map<string, typeof blockTasks>();
+  for (const t of blockTasks) {
+    const iso = ymd(t.doDate)!;
+    (blocksByDay.get(iso) ?? blocksByDay.set(iso, []).get(iso)!).push(t);
+  }
+  const allDayByDay = new Map<string, typeof allDayTasks>();
+  for (const t of allDayTasks) {
+    const iso = ymd(t.doDate)!;
+    (allDayByDay.get(iso) ?? allDayByDay.set(iso, []).get(iso)!).push(t);
+  }
+  const chainByDueDay = new Map<string, typeof chainTasks>();
+  for (const t of chainTasks) {
+    const iso = ymd(t.dueDate)!;
+    (chainByDueDay.get(iso) ?? chainByDueDay.set(iso, []).get(iso)!).push(t);
+  }
+
+  // The untimed tasks that route into shifts for the scheduled total (as WP11):
+  // active, do-dated that day, no block. Grouped by day.
+  const untimedByDay = new Map<string, RoutableTask[]>();
+  for (const t of allDayTasks) {
+    const iso = ymd(t.doDate)!;
+    const list = untimedByDay.get(iso) ?? untimedByDay.set(iso, []).get(iso)!;
+    list.push({ id: t.id, categoryId: t.categoryId, estimateMinutes: t.estimateMinutes });
+  }
+
+  const routableShiftsAll: (RoutableShift & { name: string; capacityMinutes: number | null; admittedCategoryIds: string[] })[] =
+    shifts.map((sh) => ({
+      id: sh.id,
+      name: sh.name,
+      startMinutes: hhmmToMinutes(sh.startTime) ?? 0,
+      endMinutes: hhmmToMinutes(sh.endTime) ?? 0,
+      weekdays: sh.weekdays,
+      admittedCategoryIds: sh.shiftCategories.map((sc) => sc.categoryId),
+      capacityMinutes: sh.capacityMinutes,
+    }));
+
+  let gridStart = 6 * 60; // sensible default window 06:00–22:00, widened by content
+  let gridEnd = 22 * 60;
+
+  const dayViews: CalendarDayView[] = days.map((day) => {
+    const weekday = day.weekdayIndex;
+    const activeShifts = routableShiftsAll.filter((sh) => sh.weekdays[weekday]);
+
+    // Grid bounds: widen to any active shift on the day.
+    for (const sh of activeShifts) {
+      const wholeOrWrap = sh.startMinutes >= sh.endMinutes;
+      const s = wholeOrWrap ? 0 : sh.startMinutes;
+      const e = wholeOrWrap ? 1440 : sh.endMinutes;
+      if (s < gridStart) gridStart = s;
+      if (e > gridEnd) gridEnd = e;
+    }
+
+    // Place the day's blocks (wall intervals) and accumulate each shift's block
+    // charge — the same overlap arithmetic the placement action uses.
+    const placed = blocksByDay.get(day.iso) ?? [];
+    const blockOverlapByShift = new Map<string, number>();
+    const blockViews: CalendarBlock[] = [];
+    for (const t of placed) {
+      const interval = blockGridInterval(t.blockStart as Date, t.blockEnd as Date, timezone);
+      if (interval.startMinutes < gridStart) gridStart = interval.startMinutes;
+      if (interval.endMinutes > gridEnd) gridEnd = interval.endMinutes;
+      const chargeable: ChargeableShift[] = activeShifts.map((sh) => ({
+        id: sh.id,
+        name: sh.name,
+        startMinutes: sh.startMinutes,
+        endMinutes: sh.endMinutes,
+        admittedCategoryIds: sh.admittedCategoryIds,
+        capacityMinutes: sh.capacityMinutes,
+        priorLoadMinutes: 0,
+      }));
+      const charge = chargeBlockAcrossShifts(interval, chargeable, t.categoryId);
+      for (const c of charge.charges) {
+        blockOverlapByShift.set(c.shiftId, (blockOverlapByShift.get(c.shiftId) ?? 0) + c.overlapMinutes);
+      }
+      blockViews.push({
+        id: t.id,
+        title: t.title,
+        projectName: t.project?.name ?? null,
+        startMinutes: interval.startMinutes,
+        endMinutes: interval.endMinutes,
+        timeLabel: blockTimeLabel(interval),
+        estimateMinutes: t.estimateMinutes,
+        deadline: t.dueAtUtc != null,
+        placed: true,
+      });
+    }
+
+    // Chain markers (deadline tasks due this day, not placed): drawn safe-start →
+    // due in the user's zone, read-only, magenta. Not charged.
+    for (const t of chainByDueDay.get(day.iso) ?? []) {
+      const due = t.dueAtUtc as Date;
+      const ss = safeStart(due, t.estimateMinutes);
+      const dueMin = instantToWallMinutes(due, timezone);
+      // The marker spans safe start → due when both land on this day; a safe start
+      // on an earlier day clamps to the top of the grid, and a task with no
+      // estimate shows a short 30-minute marker ending at the deadline.
+      let startMin: number;
+      if (ss) {
+        const ssDayIso = new Intl.DateTimeFormat("en-CA", {
+          timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit",
+        }).format(ss);
+        startMin = ssDayIso === day.iso ? instantToWallMinutes(ss, timezone) : 0;
+      } else {
+        startMin = Math.max(0, dueMin - 30);
+      }
+      const endMin = dueMin <= startMin ? startMin + 30 : dueMin;
+      if (startMin < gridStart) gridStart = startMin;
+      if (endMin > gridEnd) gridEnd = endMin;
+      blockViews.push({
+        id: t.id,
+        title: t.title,
+        projectName: t.project?.name ?? null,
+        startMinutes: startMin,
+        endMinutes: endMin,
+        timeLabel: blockTimeLabel({ startMinutes: startMin, endMinutes: endMin }),
+        estimateMinutes: t.estimateMinutes,
+        deadline: true,
+        placed: false,
+      });
+    }
+
+    // The bands, with remaining = capacity − (routed untimed + block overlaps).
+    const routed = routeTasks(
+      activeShifts.map((sh) => ({
+        id: sh.id, startMinutes: sh.startMinutes, endMinutes: sh.endMinutes,
+        weekdays: sh.weekdays, admittedCategoryIds: sh.admittedCategoryIds,
+      })),
+      untimedByDay.get(day.iso) ?? [],
+      weekday
+    ).byShift;
+
+    let scheduledTotal = 0;
+    const bands: CalendarBand[] = activeShifts.map((sh) => {
+      const load = shiftLoad(
+        routed.get(sh.id) ?? [],
+        sh.capacityMinutes,
+        blockOverlapByShift.get(sh.id) ?? 0
+      );
+      scheduledTotal += load.scheduledMinutes;
+      return {
+        id: sh.id,
+        name: sh.name,
+        startMinutes: sh.startMinutes,
+        endMinutes: sh.endMinutes,
+        wholeDay: sh.startMinutes >= sh.endMinutes,
+        remainingLabel: remainingLabel(load.remainingMinutes),
+        unestimatedLabel: unestimatedLabel(load.unestimatedCount),
+      };
+    });
+
+    const allDay: CalendarAllDayItem[] = (allDayByDay.get(day.iso) ?? []).map((t) => ({
+      id: t.id,
+      title: t.title,
+      projectName: t.project?.name ?? null,
+      deadline: t.dueAtUtc != null,
+    }));
+
+    const header =
+      bands.length === 0
+        ? "no shifts"
+        : `${fmtMinutes(scheduledTotal)} across ${bands.length} shift${bands.length === 1 ? "" : "s"}`;
+
+    // Blocks earliest first for a stable render order.
+    blockViews.sort((a, b) => a.startMinutes - b.startMinutes);
+
+    return { day, bands, allDay, blocks: blockViews, header };
+  });
+
+  const rail: CalendarRailItem[] = railSource
+    .filter((t) => t.doDate == null && t.blockStart == null && t.dueAtUtc == null)
+    .map((t) => ({
+      id: t.id,
+      title: t.title,
+      projectName: t.project?.name ?? null,
+      estimateMinutes: t.estimateMinutes,
+      estimateLabel: t.estimateMinutes == null ? "no estimate" : fmtMinutes(t.estimateMinutes),
+      deadline: false,
+    }));
+
+  // Snap grid bounds to whole hours for a clean ruler.
+  gridStart = Math.max(0, Math.floor(gridStart / 60) * 60);
+  gridEnd = Math.min(1440 + 12 * 60, Math.ceil(gridEnd / 60) * 60);
+  if (gridEnd <= gridStart) gridEnd = gridStart + 60;
+
+  return {
+    today,
+    dayCount,
+    timezone,
+    days: dayViews,
+    rail,
+    gridStartMinutes: gridStart,
+    gridEndMinutes: gridEnd,
+  };
+}
+
+/** One task with the fields a block write needs (its category for the charge,
+ *  its estimate for the default length, its kind for the start-reminder sync). */
+export function getTaskForBlock(id: string) {
+  return prisma.task.findFirst({
+    where: { id, deletedAt: null },
+    include: { category: { select: { name: true } } },
+  });
+}
+
+/**
+ * The charge context for a day: the shifts active on it, each carrying the minutes
+ * already charged to it by OTHER work (routed untimed tasks + other placed blocks,
+ * excluding `excludeTaskId` — the block being placed). The placement action charges
+ * the new block against these priors to see the true remaining and whether the drop
+ * pushes any shift over capacity. `dayLabel` is the long weekday for the tablet.
+ */
+export async function getDayChargeContext(
+  dayIso: string,
+  excludeTaskId: string
+): Promise<{ activeShifts: ChargeableShift[]; dayLabel: string }> {
+  const timezone = await getUserTimezone();
+  const weekday = weekdayOf(dayIso);
+  const dayLabel = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "long" }).format(
+    isoToDbDate(dayIso)
+  );
+
+  const [shifts, untimed, otherBlocks] = await Promise.all([
+    prisma.shift.findMany({
+      orderBy: [{ startTime: "asc" }, { createdAt: "asc" }],
+      include: { shiftCategories: { select: { categoryId: true } } },
+    }),
+    prisma.task.findMany({
+      where: {
+        deletedAt: null, status: "active", blockStart: null, doDate: isoToDbDate(dayIso),
+        id: { not: excludeTaskId },
+      },
+      select: { id: true, categoryId: true, estimateMinutes: true },
+    }),
+    prisma.task.findMany({
+      where: {
+        deletedAt: null, status: "active", blockStart: { not: null }, doDate: isoToDbDate(dayIso),
+        id: { not: excludeTaskId },
+      },
+      select: { id: true, blockStart: true, blockEnd: true, categoryId: true },
+    }),
+  ]);
+
+  const active = shifts
+    .filter((sh) => sh.weekdays[weekday])
+    .map((sh) => ({
+      id: sh.id,
+      name: sh.name,
+      startMinutes: hhmmToMinutes(sh.startTime) ?? 0,
+      endMinutes: hhmmToMinutes(sh.endTime) ?? 0,
+      weekdays: sh.weekdays,
+      admittedCategoryIds: sh.shiftCategories.map((sc) => sc.categoryId),
+      capacityMinutes: sh.capacityMinutes,
+    }));
+
+  // Routed untimed minutes per shift.
+  const routed = routeTasks(
+    active.map((sh) => ({ id: sh.id, startMinutes: sh.startMinutes, endMinutes: sh.endMinutes, weekdays: sh.weekdays, admittedCategoryIds: sh.admittedCategoryIds })),
+    untimed.map((t) => ({ id: t.id, categoryId: t.categoryId, estimateMinutes: t.estimateMinutes })),
+    weekday
+  ).byShift;
+
+  const priorByShift = new Map<string, number>();
+  for (const sh of active) {
+    const tasks = routed.get(sh.id) ?? [];
+    priorByShift.set(sh.id, tasks.reduce((s, t) => s + (t.estimateMinutes ?? 0), 0));
+  }
+  // Add other placed blocks' overlaps.
+  for (const b of otherBlocks) {
+    const interval = blockGridInterval(b.blockStart as Date, b.blockEnd as Date, timezone);
+    const charge = chargeBlockAcrossShifts(
+      interval,
+      active.map((sh) => ({ ...sh, priorLoadMinutes: 0 })),
+      b.categoryId
+    );
+    for (const c of charge.charges) {
+      priorByShift.set(c.shiftId, (priorByShift.get(c.shiftId) ?? 0) + c.overlapMinutes);
+    }
+  }
+
+  const activeShifts: ChargeableShift[] = active.map((sh) => ({
+    id: sh.id,
+    name: sh.name,
+    startMinutes: sh.startMinutes,
+    endMinutes: sh.endMinutes,
+    admittedCategoryIds: sh.admittedCategoryIds,
+    capacityMinutes: sh.capacityMinutes,
+    priorLoadMinutes: priorByShift.get(sh.id) ?? 0,
+  }));
+
+  return { activeShifts, dayLabel };
+}
+
+/** The day's shifts and the tasks/blocks already charged to a given shift, for
+ *  the over-capacity popup's "everything on this shift" list (the queue proper is
+ *  WP18). Reads the placed blocks and untimed tasks that land on the shift. */
+export async function getShiftChargeList(shiftId: string, dayIso: string): Promise<{
+  shiftName: string;
+  items: { id: string; title: string; kind: "block" | "task"; minutesLabel: string }[];
+} | null> {
+  const timezone = await getUserTimezone();
+  const shift = await prisma.shift.findUnique({
+    where: { id: shiftId },
+    include: { shiftCategories: { select: { categoryId: true } } },
+  });
+  if (!shift) return null;
+  const sh = {
+    id: shift.id,
+    name: shift.name,
+    startMinutes: hhmmToMinutes(shift.startTime) ?? 0,
+    endMinutes: hhmmToMinutes(shift.endTime) ?? 0,
+    admittedCategoryIds: shift.shiftCategories.map((sc) => sc.categoryId),
+    capacityMinutes: shift.capacityMinutes,
+    priorLoadMinutes: 0,
+  };
+  const weekday = weekdayOf(dayIso);
+  const [blockTasks, untimed] = await Promise.all([
+    prisma.task.findMany({
+      where: { deletedAt: null, status: "active", blockStart: { not: null }, doDate: isoToDbDate(dayIso) },
+      select: { id: true, title: true, blockStart: true, blockEnd: true, categoryId: true },
+    }),
+    prisma.task.findMany({
+      where: { deletedAt: null, status: "active", blockStart: null, doDate: isoToDbDate(dayIso) },
+      select: { id: true, title: true, categoryId: true, estimateMinutes: true },
+    }),
+  ]);
+
+  const items: { id: string; title: string; kind: "block" | "task"; minutesLabel: string }[] = [];
+  for (const t of blockTasks) {
+    const interval: BlockInterval = blockGridInterval(t.blockStart as Date, t.blockEnd as Date, timezone);
+    const charge = chargeBlockAcrossShifts(interval, [sh], t.categoryId);
+    const c = charge.charges.find((x) => x.shiftId === shiftId);
+    if (c && c.overlapMinutes > 0) {
+      items.push({ id: t.id, title: t.title, kind: "block", minutesLabel: fmtMinutes(c.overlapMinutes) });
+    }
+  }
+  // Untimed tasks routed to this shift.
+  const routed = routeTasks(
+    // Only this shift matters for the list; routing needs the active set, but a
+    // single-shift route answers "does it land here" for this shift alone.
+    [{ id: sh.id, startMinutes: sh.startMinutes, endMinutes: sh.endMinutes, weekdays: shift.weekdays, admittedCategoryIds: sh.admittedCategoryIds }],
+    untimed.map((t) => ({ id: t.id, categoryId: t.categoryId, estimateMinutes: t.estimateMinutes })),
+    weekday
+  ).byShift.get(sh.id) ?? [];
+  for (const t of routed) {
+    const src = untimed.find((u) => u.id === t.id)!;
+    items.push({
+      id: t.id,
+      title: src.title,
+      kind: "task",
+      minutesLabel: src.estimateMinutes == null ? "no estimate" : fmtMinutes(src.estimateMinutes),
+    });
+  }
+
+  return { shiftName: shift.name, items };
 }
