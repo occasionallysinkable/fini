@@ -17,6 +17,7 @@ import { LeftRail } from "./Nav";
 import { CaptureBox } from "./CaptureBox";
 import { Today } from "./Today";
 import { NotificationSetup } from "./notifications/NotificationSetup";
+import { EngagementBeacon } from "./EngagementBeacon";
 
 export default async function Home() {
   const session = await auth();
@@ -63,6 +64,7 @@ export default async function Home() {
         <section className="mt-10">
           <NotificationSetup vapidPublicKey={vapidPublicKey} />
         </section>
+        <EngagementBeacon />
       </main>
     </div>
   );

@@ -1,8 +1,10 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { headers } from "next/headers";
 import { auth } from "@/auth";
 import { mutate, undo, type UndoOp } from "@/lib/mutate";
+import { recordEngagement, detectPlatform } from "@/lib/engagement";
 import {
   getTask,
   getProjectById,
@@ -29,6 +31,24 @@ async function requireUser() {
   const session = await auth();
   if (!session?.user) throw new Error("Not signed in.");
   return session.user;
+}
+
+/** The platform the current request came from, read honestly off the User-Agent
+ *  (WP10 · engagement). */
+async function requestPlatform() {
+  const ua = (await headers()).get("user-agent");
+  return detectPlatform(ua);
+}
+
+/**
+ * WP10 · the "open" engagement event. Called once from a small client beacon when
+ * today mounts (not from the server render, which also runs on prefetch and would
+ * count opens nobody made). recordEngagement dedupes a burst of these into one
+ * visit, so a re-render does not inflate the count.
+ */
+export async function recordOpen(): Promise<void> {
+  await requireUser();
+  await recordEngagement("open", await requestPlatform());
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +281,11 @@ export async function captureTask(
       return task;
     },
   });
+
+  // WP10 · a successful capture is one of the three engagement moments. Telemetry,
+  // not a domain mutation — it takes the lightweight path, not mutate() (see
+  // @/lib/engagement for the one-line justification against invariant 1).
+  await recordEngagement("capture", await requestPlatform());
 
   revalidatePath("/");
   return { ok: true, summary: `Added “${p.title}”` };
